@@ -146,12 +146,21 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         lp_duplicates = []
 
         for obj in lp_objects:
-            # Дублюємо об'єкт
-            obj_copy = obj.copy()
-            obj_copy.data = obj.data.copy() # Копіюємо сам меш
-            context.scene.collection.objects.link(obj_copy) # Лінкуємо в сцену
-            obj_copy.select_set(True) # Виділяємо копію
-            lp_duplicates.append(obj_copy)
+            if obj.type == 'MESH':
+                # Duplicate the object container and mesh data
+                obj_copy = obj.copy()
+                obj_copy.data = obj.data.copy()
+                context.scene.collection.objects.link(obj_copy)
+                
+                # FIXED: Apply all modifiers by converting the temporary duplicate to a clean mesh
+                # We temporarily make it active to ensure the convert operator targets it correctly
+                context.view_layer.objects.active = obj_copy
+                obj_copy.select_set(True)
+                bpy.ops.object.convert(target='MESH')
+                
+                # Re-evaluate the object reference after conversion and add to our merge list
+                obj_copy = context.view_layer.objects.active
+                lp_duplicates.append(obj_copy)
 
         # Робимо останню копію активною для об'єднання
         context.view_layer.objects.active = lp_duplicates[-1]
@@ -169,11 +178,18 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         hp_duplicates = []
 
         for obj in hp_objects:
-            obj_copy = obj.copy()
-            obj_copy.data = obj.data.copy()
-            context.scene.collection.objects.link(obj_copy)
-            obj_copy.select_set(True)
-            hp_duplicates.append(obj_copy)
+            if obj.type == 'MESH':
+                obj_copy = obj.copy()
+                obj_copy.data = obj.data.copy()
+                context.scene.collection.objects.link(obj_copy)
+                
+                # FIXED: Apply all modifiers for each High-Poly object before joining
+                context.view_layer.objects.active = obj_copy
+                obj_copy.select_set(True)
+                bpy.ops.object.convert(target='MESH')
+                
+                obj_copy = context.view_layer.objects.active
+                hp_duplicates.append(obj_copy)
 
         context.view_layer.objects.active = hp_duplicates[-1]
         
