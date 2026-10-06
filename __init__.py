@@ -580,8 +580,32 @@ class OBJECT_OT_finalize_bake(bpy.types.Operator):
         nodes.active = node_final_target
         node_final_target.select = True
 
-        # Route the Mix Node directly into the Material Output's Surface input
-        links.new(node_mix.outputs['Result'], material_output.inputs['Surface'])
+        # Check if the DirectX normal map output format is requested by the artist
+        if scene.smart_bake_directx:
+            # Create math and vector nodes to dynamically invert the Green channel vector on the fly
+            node_sep = nodes.new(type='ShaderNodeSeparateColor')
+            node_comb = nodes.new(type='ShaderNodeCombineColor')
+            node_inv_g = nodes.new(type='ShaderNodeMath')
+            
+            node_inv_g.operation = 'SUBTRACT'
+            node_inv_g.inputs[0].default_value = 1.0 # 1.0 - Green channel = Inverted Green channel
+            
+            # Create a network of links to reconstruct the color channels with inverted Y axis
+            links.new(node_mix.outputs['Result'], node_sep.inputs['Color'])
+            
+            # Pass Red and Blue channels directly untouched
+            links.new(node_sep.outputs['Red'], node_comb.inputs['Red'])
+            links.new(node_sep.outputs['Blue'], node_comb.inputs['Blue'])
+            
+            # Invert the Green channel vector mathematically
+            links.new(node_sep.outputs['Green'], node_inv_g.inputs[1])
+            links.new(node_inv_g.outputs['Value'], node_comb.inputs['Green'])
+            
+            # Connect the combined DirectX color stream to the material surface output socket
+            links.new(node_comb.outputs['Color'], material_output.inputs['Surface'])
+        else:
+            # Route the Mix Node directly into the Material Output's Surface input
+            links.new(node_mix.outputs['Result'], material_output.inputs['Surface'])
 
         # === 2. RUN ULTRA-FAST BACKGROUND EMIT BAKE WITH TANGENT COLOR CLEAR ===
         scene.render.engine = 'CYCLES'
@@ -694,6 +718,9 @@ class VIEW3D_PT_maps_panel(bpy.types.Panel):
         # Add the text field property for user-defined texture name
         layout.prop(scene, "smart_bake_filename", text="Name")
         layout.prop(scene, "smart_bake_resolution", text="Resolution")
+        # Expose the DirectX format checkbox toggler right in the settings sub-layout
+        layout.prop(scene, "smart_bake_directx", text="DirectX")
+        
         layout.prop(scene, "smart_bake_extrusion", text="Ray Height")
 
 
@@ -726,7 +753,13 @@ def register():
         name="File Name",
         description="Base name for the generated baking textures",
         default="T_Model_Normal"
-    )    
+    )
+    # Register the DirectX normal map format option flag
+    bpy.types.Scene.smart_bake_directx = bpy.props.BoolProperty(
+        name="DirectX (-Y)",
+        description="Invert the Green channel to match DirectX normal map format standards",
+        default=False
+    )   
 
 
 def unregister():
@@ -735,3 +768,4 @@ def unregister():
     del bpy.types.Scene.smart_bake_resolution
     del bpy.types.Scene.smart_bake_extrusion
     del bpy.types.Scene.smart_bake_filename
+    del bpy.types.Scene.smart_bake_directx
