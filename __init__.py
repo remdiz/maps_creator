@@ -107,6 +107,44 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
 
         return True
 
+
+    @classmethod
+    def _prepare_and_merge_collection(cls, context, collection_name, target_merged_name):
+        """Duplicates mesh objects from a collection, applies modifiers, and merges them into one"""
+        collection = bpy.data.collections.get(collection_name)
+        duplicates = []
+
+        # Duplicate and apply modifiers via conversion
+        for obj in collection.objects:
+            if obj.type == 'MESH':
+                obj_copy = obj.copy()
+                obj_copy.data = obj.data.copy()
+                context.scene.collection.objects.link(obj_copy)
+                
+                # Make it active to apply modifiers via mesh conversion safely
+                context.view_layer.objects.active = obj_copy
+                obj_copy.select_set(True)
+                bpy.ops.object.convert(target='MESH')
+                
+                # Refresh reference and save to list
+                obj_copy = context.view_layer.objects.active
+                duplicates.append(obj_copy)
+
+        # Merge duplicates together
+        context.view_layer.objects.active = duplicates[-1]
+        for d in duplicates:
+            d.select_set(True)
+
+        bpy.ops.object.join()
+        
+        merged_mesh = context.view_layer.objects.active
+        merged_mesh.name = target_merged_name
+        
+        # Deselect the output object to clear context for the next steps
+        bpy.ops.object.select_all(action='DESELECT')
+        return merged_mesh
+
+
     def execute(self, context):
         # Run pre-bake cleanup to wipe any leftovers from previous sessions
         self.report({'INFO'}, "Performing pre-bake cleanup...")
@@ -142,61 +180,14 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         bpy.ops.object.select_all(action='DESELECT')    
 
         # === Step 1: MERGING LOW-POLY (LP) ===
-        lp_objects = list(bpy.data.collections["LP"].objects)
-        lp_duplicates = []
+        self.report({'INFO'}, "Processing and merging Low-Poly collection...")
+        merged_lp = self._prepare_and_merge_collection(context, "LP", self.MERGED_LP_NAME)
 
-        for obj in lp_objects:
-            if obj.type == 'MESH':
-                # Duplicate the object container and mesh data
-                obj_copy = obj.copy()
-                obj_copy.data = obj.data.copy()
-                context.scene.collection.objects.link(obj_copy)
-                
-                # FIXED: Apply all modifiers by converting the temporary duplicate to a clean mesh
-                # We temporarily make it active to ensure the convert operator targets it correctly
-                context.view_layer.objects.active = obj_copy
-                obj_copy.select_set(True)
-                bpy.ops.object.convert(target='MESH')
-                
-                # Re-evaluate the object reference after conversion and add to our merge list
-                obj_copy = context.view_layer.objects.active
-                lp_duplicates.append(obj_copy)
-
-        # Робимо останню копію активною для об'єднання
-        context.view_layer.objects.active = lp_duplicates[-1]
-
-        # Об'єднуємо всі виділені копії LP в один меш
-        bpy.ops.object.join()
-        merged_lp = context.view_layer.objects.active
-        merged_lp.name = self.MERGED_LP_NAME # "_Bake_Merged_LowPoly"
-
-        # Знімаємо виділення з об'єднаного LP
-        bpy.ops.object.select_all(action='DESELECT')
 
         # === STEP 2: MERGING HIGH-POLY (HP) ===
-        hp_objects = list(bpy.data.collections["HP"].objects)
-        hp_duplicates = []
-
-        for obj in hp_objects:
-            if obj.type == 'MESH':
-                obj_copy = obj.copy()
-                obj_copy.data = obj.data.copy()
-                context.scene.collection.objects.link(obj_copy)
-                
-                # FIXED: Apply all modifiers for each High-Poly object before joining
-                context.view_layer.objects.active = obj_copy
-                obj_copy.select_set(True)
-                bpy.ops.object.convert(target='MESH')
-                
-                obj_copy = context.view_layer.objects.active
-                hp_duplicates.append(obj_copy)
-
-        context.view_layer.objects.active = hp_duplicates[-1]
+        self.report({'INFO'}, "Processing and merging High-Poly collection...")
+        merged_hp = self._prepare_and_merge_collection(context, "HP", self.MERGED_HP_NAME)
         
-        # Об'єднуємо всі копії HP в один меш
-        bpy.ops.object.join()
-        merged_hp = context.view_layer.objects.active
-        merged_hp.name = self.MERGED_HP_NAME # "_Bake_Merged_HighPoly"
 
         # === STEP 3: PREPARE SELECTED TO ACTIVE ===
         # Для запікання Selected to Active: High-Poly має бути ВИДІЛЕНИМ,
@@ -245,28 +236,21 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         merged_lp.data.materials.append(bake_mat)
 
         nodes = bake_mat.node_tree.nodes
+
+        def create_texture_node(nodes_obj, img, label, loc):
+            t_node = nodes_obj.new(type='ShaderNodeTexImage')
+            t_node.image = img
+            t_node.label = label
+            t_node.location = loc
+            return t_node
         
-        # Создаем ноды текстур нормалей
-        node_smooth = nodes.new(type='ShaderNodeTexImage')
-        node_smooth.image = img_smooth
-        node_smooth.label = "Bake Target: SMOOTH"
-        node_smooth.location = (-600, 400)
-        
-        node_flat = nodes.new(type='ShaderNodeTexImage')
-        node_flat.image = img_flat
-        node_flat.label = "Bake Target: FLAT"
-        node_flat.location = (-600, 150)
-               
-        # Создаем ноду маски
-        node_mask = nodes.new(type='ShaderNodeTexImage')
-        node_mask.image = img_mask
-        node_mask.label = "Paint Mask"
-        node_mask.location = (-600, -100)
-                
+
         # Nodes links for future use
-        self.node_smooth_ref = node_smooth
-        self.node_flat_ref = node_flat
-        self.node_mask_ref = node_mask
+        # Normal texture nodes creation
+        self.node_smooth_ref = create_texture_node(nodes, img_smooth, "Bake Target: SMOOTH", (-600, 400))
+        self.node_flat_ref = create_texture_node(nodes, img_flat, "Bake Target: FLAT", (-600, 150))
+        # Mask node creation
+        self.node_mask_ref = create_texture_node(nodes, img_mask, "Paint Mask", (-600, -100))
 
         self.report({'INFO'}, f"Textures {res}x{res} ready. Nodes compiled.")    
 
