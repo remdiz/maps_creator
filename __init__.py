@@ -11,8 +11,14 @@
 # You should have received a copy of the GNU General Public License
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 
+# ============================TODO======================================
+#   - Testing
+#   - 
+# ==================================================================
+
 import bpy
 import os
+import time
 
 # Определяем варианты разрешения текстур
 texture_res_items = [
@@ -53,6 +59,7 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
     @classmethod
     def delete_object(cls, target):
         """Completely remove target mesh object"""
+        # TODO: do we really need all this stuff to remove object?
         if target.name in bpy.data.objects:
             # Unlink from all collections first
             for col in list(target.users_collection):
@@ -63,11 +70,11 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
             if target_mesh_data:
                 bpy.data.meshes.remove(target_mesh_data, do_unlink=True)
     
-    # FIXED: Added @classmethod decorator for bulletproof repetitive execution
     @classmethod
     def cleanup_assets(cls, context, clean_geometry=True, clean_materials=True, clean_textures=True):
         """Safely removes temporary baking assets from Blender database"""
         
+        cl_time = time.time()
         # 1. Clean up temporary meshes and objects
         if clean_geometry:
             for name in [cls.MERGED_LP_NAME, cls.MERGED_HP_NAME]:
@@ -87,6 +94,7 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
                 img = bpy.data.images.get(name)
                 if img:
                     bpy.data.images.remove(img, do_unlink=True)
+        cls.report({'INFO'}, "Performing pre-bake cleanup...")            
 
     
     @classmethod
@@ -152,7 +160,7 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
 
         
         # === Step 0: UV MAPS VALIDATION ON LOW-POLY ===
-        lp_objects = list(bpy.data.collections["LP"].objects)
+        lp_objects = bpy.data.collections["LP"].objects
         missing_uv_objects = []
 
         for obj in lp_objects:
@@ -170,8 +178,9 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
             
         self.report({'INFO'}, "Geometry proccessing...")
         # Save links to originally active and selected objects
-        original_active = context.view_layer.objects.active
-        original_selected = list(context.selected_objects)
+        # TODO: maybe later?
+        # original_active = context.view_layer.objects.active
+        # original_selected = context.selected_objects
 
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
@@ -663,25 +672,32 @@ class VIEW3D_PT_maps_panel(bpy.types.Panel):
         lp_count = len(lp_col.objects) if lp_col else 0
         hp_count = len(hp_col.objects) if hp_col else 0
         layout.label(text="Models for Baking:")
-        
+
         # Low-Poly button
-        row = layout.row(align=True)
-        op_lp = row.operator("object.create_collection", text=f"Add to Low-Poly ({lp_count} pcs)", icon='MESH_ICOSPHERE')
+        # row = layout.row(align=True)
+        op_lp = layout.operator(
+            "object.create_collection", 
+            text=f"Add to Low-Poly ({lp_count} pcs)", 
+            icon='MESH_ICOSPHERE')
         op_lp.col_name = "LP" 
 
         # High-Poly button
-        row = layout.row(align=True)
-        op_hp = row.operator("object.create_collection", text=f"Add to High-Poly ({hp_count} pcs)", icon='MESH_MONKEY')
+        # row = layout.row(align=True)
+        op_hp = layout.operator(
+            "object.create_collection", 
+            text=f"Add to High-Poly ({hp_count} pcs)", 
+            icon='MESH_MONKEY')
         op_hp.col_name = "HP"
+
         layout.separator()
         # Baking Button
         layout.label(text="Baking textures:")
-        col = layout.column(align=True)
+        # col = layout.column(align=True)
         
-        col.operator("object.bake_normals", text="Bake Normals", icon='MESH_MONKEY')
+        layout.operator("object.bake_normals", text="Bake Normals", icon='MESH_MONKEY')
         # Context warning when button is inactive
         if lp_count == 0 or hp_count == 0:
-            box = col.box()
+            box = layout.box()
             box.scale_y = 0.8
             if lp_count == 0 and hp_count == 0:
                 box.label(text="Add objects to LP and HP!", icon='ERROR')
@@ -692,11 +708,11 @@ class VIEW3D_PT_maps_panel(bpy.types.Panel):
         merged_lp_exists = bpy.data.objects.get(OBJECT_OT_bake_normals.MERGED_LP_NAME) is not None
         
         if merged_lp_exists:
-            col.separator()
+            layout.separator()
             # Highlights the button in blue/accent color to draw user's attention
-            col.operator("object.activate_skew_paint", text="Paint Skew Correction", icon='BRUSH_DATA')
+            layout.operator("object.activate_skew_paint", text="Paint Skew Correction", icon='BRUSH_DATA')
             # Display the finalization button right under the brush tool
-            col.operator("object.finalize_bake", text="Finalize & Export Map", icon='DISK_DRIVE')
+            layout.operator("object.finalize_bake", text="Finalize & Export Map", icon='DISK_DRIVE')
         layout.separator()
         layout.label(text="Texture settings:")
         # Add the text field property for user-defined texture name
