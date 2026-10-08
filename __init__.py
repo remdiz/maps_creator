@@ -13,18 +13,19 @@
 
 # ============================TODO======================================
 #   - Testing
-#   - 
+#   - Get rid of using names of objects and materials, use references instead
+#   - Cursor change
 # ==================================================================
 
 import bpy
 import os
 import time
 
-# Определяем варианты разрешения текстур
+
 texture_res_items = [
-    ('1024', "1K (1024x1024)", "Запекать в разрешении 1024x1024"),
-    ('2048', "2K (2048x2048)", "Запекать в разрешении 2048x2048"),
-    ('4096', "4K (4096x4096)", "Запекать в разрешении 4096x4096"),
+    ('1024', "1K (1024x1024)", "Bake resolution 1024x1024"),
+    ('2048', "2K (2048x2048)", "Bake resolution 2048x2048"),
+    ('4096', "4K (4096x4096)", "Bake resolution 4096x4096"),
 ]
 
 bl_info = {
@@ -55,26 +56,24 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
     TEX_FLAT_NAME = "T_Bake_Normal_Flat"
     TEX_MASK_NAME = "T_Bake_Skew_Mask"
 
-    # FIXED: Added @classmethod decorator to prevent context overriding bugs
+
     @classmethod
     def delete_object(cls, target):
-        """Completely remove target mesh object"""
-        # TODO: do we really need all this stuff to remove object?
-        if target.name in bpy.data.objects:
+        """Completely remove target mesh object (assumes target exist)"""
+        # if target.name in bpy.data.objects:
             # Unlink from all collections first
-            for col in list(target.users_collection):
-                col.objects.unlink(target)
+            # for col in list(target.users_collection):
+            #     col.objects.unlink(target)
             # Remove object and mesh data blocks from memory
-            target_mesh_data = target.data
-            bpy.data.objects.remove(target, do_unlink=True)
-            if target_mesh_data:
+        target_mesh_data = target.data
+        bpy.data.objects.remove(target, do_unlink=True)
+        if target_mesh_data and target_mesh_data.users == 0:
                 bpy.data.meshes.remove(target_mesh_data, do_unlink=True)
     
     @classmethod
     def cleanup_assets(cls, context, clean_geometry=True, clean_materials=True, clean_textures=True):
         """Safely removes temporary baking assets from Blender database"""
         
-        cl_time = time.time()
         # 1. Clean up temporary meshes and objects
         if clean_geometry:
             for name in [cls.MERGED_LP_NAME, cls.MERGED_HP_NAME]:
@@ -94,12 +93,13 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
                 img = bpy.data.images.get(name)
                 if img:
                     bpy.data.images.remove(img, do_unlink=True)
-        cls.report({'INFO'}, "Performing pre-bake cleanup...")            
+        
 
     
     @classmethod
     def poll(cls, context):
         # Button is active only in Object Mode
+        # TODO: redundant maybe, check later
         if context.mode != 'OBJECT':
             return False
 
@@ -122,21 +122,30 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         collection = bpy.data.collections.get(collection_name)
         duplicates = []
 
+        depsgraph = context.evaluated_depsgraph_get()
+
         # Duplicate and apply modifiers via conversion
         for obj in collection.objects:
             if obj.type == 'MESH':
-                obj_copy = obj.copy()
-                obj_copy.data = obj.data.copy()
-                context.scene.collection.objects.link(obj_copy)
+                # Duplicate object w/o using operators
+                object_eval = obj.evaluated_get(depsgraph)
+                mesh_from_eval = bpy.data.meshes.new_from_object(object_eval)
+                new_obj = bpy.data.objects.new(obj.name, mesh_from_eval)
+                context.scene.collection.objects.link(new_obj)
+                duplicates.append(new_obj)
                 
-                # Make it active to apply modifiers via mesh conversion safely
-                context.view_layer.objects.active = obj_copy
-                obj_copy.select_set(True)
-                bpy.ops.object.convert(target='MESH')
+                # obj_copy = obj.copy()
+                # obj_copy.data = obj.data.copy()
+                # context.scene.collection.objects.link(obj_copy)
                 
-                # Refresh reference and save to list
-                obj_copy = context.view_layer.objects.active
-                duplicates.append(obj_copy)
+                # # Make it active to apply modifiers via mesh conversion safely
+                # context.view_layer.objects.active = obj_copy
+                # obj_copy.select_set(True)
+                # bpy.ops.object.convert(target='MESH')
+                
+                # # Refresh reference and save to list
+                # obj_copy = context.view_layer.objects.active
+                # duplicates.append(obj_copy)
 
         # Merge duplicates together
         context.view_layer.objects.active = duplicates[-1]
@@ -154,10 +163,11 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
 
 
     def execute(self, context):
+        start_time = time.time()
         # Run pre-bake cleanup to wipe any leftovers from previous sessions
         self.report({'INFO'}, "Performing pre-bake cleanup...")
         self.cleanup_assets(context)
-
+        self.report({'INFO'}, f"Cleanup complete in {time.time() - start_time:.2f}s.")
         
         # === Step 0: UV MAPS VALIDATION ON LOW-POLY ===
         lp_objects = bpy.data.collections["LP"].objects
