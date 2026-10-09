@@ -12,12 +12,13 @@
 # along with this program. If not, see <http://www.gnu.org/licenses/>.
 
 # ============================TODO======================================
-#   - Testing
+#   - Testing https://share.google/aimode/3KIwIqBOAgwVyvUNi
 #   - Get rid of using names of objects and materials, use references instead
 #   - Cursor change
 # ==================================================================
 
 import bpy
+import bmesh
 import os
 import time
 
@@ -120,19 +121,34 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
     def _prepare_and_merge_collection(cls, context, collection_name, target_merged_name):
         """Duplicates mesh objects from a collection, applies modifiers, and merges them into one"""
         collection = bpy.data.collections.get(collection_name)
-        duplicates = []
+        bm = bmesh.new()
+        # Create a new empty mesh and object to join the selected objects into
+        new_mesh = bpy.data.meshes.new(target_merged_name)
+        new_object = bpy.data.objects.new(target_merged_name, new_mesh)
+
+        # duplicates = []
 
         depsgraph = context.evaluated_depsgraph_get()
 
-        # Duplicate and apply modifiers via conversion
+        # Duplicate and apply modifiers via bmesh
         for obj in collection.objects:
             if obj.type == 'MESH':
                 # Duplicate object w/o using operators
                 object_eval = obj.evaluated_get(depsgraph)
                 mesh_from_eval = bpy.data.meshes.new_from_object(object_eval)
-                new_obj = bpy.data.objects.new(obj.name, mesh_from_eval)
-                context.scene.collection.objects.link(new_obj)
-                duplicates.append(new_obj)
+                matrix = obj.matrix_world
+
+                # Apply the object's transform matrix to the mesh using a copy. this is just one way to do this,
+                # you could also use bm.transform, etc.
+                mesh_copy = mesh_from_eval.copy()
+                mesh_copy.transform(matrix)
+
+                # Add the transformed mesh to the bmesh
+                bm.from_mesh(mesh_copy)
+
+                # new_obj = bpy.data.objects.new(obj.name, mesh_from_eval)
+                # context.scene.collection.objects.link(new_obj)
+                # duplicates.append(new_obj)
                 
                 # obj_copy = obj.copy()
                 # obj_copy.data = obj.data.copy()
@@ -147,19 +163,25 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
                 # obj_copy = context.view_layer.objects.active
                 # duplicates.append(obj_copy)
 
-        # Merge duplicates together
-        context.view_layer.objects.active = duplicates[-1]
-        for d in duplicates:
-            d.select_set(True)
+        # Convert the bmesh to the new mesh
+        bm.to_mesh(new_mesh)
+        # Link the new object to the scene and select it
+        context.scene.collection.objects.link(new_object)
+  
+        # # Merge duplicates together
+        # context.view_layer.objects.active = duplicates[-1]
+        # for d in duplicates:
+        #     d.select_set(True)
 
-        bpy.ops.object.join()
+        # bpy.ops.object.join()
         
-        merged_mesh = context.view_layer.objects.active
-        merged_mesh.name = target_merged_name
+        # merged_mesh = context.view_layer.objects.active
+        # merged_mesh.name = target_merged_name
         
         # Deselect the output object to clear context for the next steps
-        bpy.ops.object.select_all(action='DESELECT')
-        return merged_mesh
+        # bpy.ops.object.select_all(action='DESELECT')
+        bm.free()
+        return new_object
 
 
     def execute(self, context):
