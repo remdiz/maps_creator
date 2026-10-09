@@ -105,12 +105,22 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
             return False
 
         # Check if LP collection exists and has objects
-        lp_col = bpy.data.collections.get("LP")
-        if not lp_col or not lp_col.objects:
-            return False
+        # lp_col = bpy.data.collections.get("LP")
+        # if not lp_col or not lp_col.objects:
+        #     return False
 
         # Check if HP collection exists and has objects
-        hp_col = bpy.data.collections.get("HP")
+        # hp_col = bpy.data.collections.get("HP")
+        # if not hp_col or not hp_col.objects:
+        #     return False
+
+        scene = context.scene
+        # FIXED: Access references directly from Scene data model
+        lp_col = scene.smart_bake_lp_collection
+        hp_col = scene.smart_bake_hp_collection
+        
+        if not lp_col or not lp_col.objects:
+            return False
         if not hp_col or not hp_col.objects:
             return False
 
@@ -118,9 +128,9 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
 
 
     @classmethod
-    def _prepare_and_merge_collection(cls, context, collection_name, target_merged_name):
+    def _prepare_and_merge_collection(cls, context, collection, target_merged_name):
         """Duplicates mesh objects from a collection, applies modifiers, and merges them into one"""
-        collection = bpy.data.collections.get(collection_name)
+        # collection = bpy.data.collections.get(collection_name)
         bm = bmesh.new()
         # Create a new empty mesh and object to join the selected objects into
         new_mesh = bpy.data.meshes.new(target_merged_name)
@@ -186,13 +196,14 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
 
     def execute(self, context):
         start_time = time.time()
+        scene = context.scene
         # Run pre-bake cleanup to wipe any leftovers from previous sessions
         self.report({'INFO'}, "Performing pre-bake cleanup...")
         self.cleanup_assets(context)
         self.report({'INFO'}, f"Cleanup complete in {time.time() - start_time:.2f}s.")
         
         # === Step 0: UV MAPS VALIDATION ON LOW-POLY ===
-        lp_objects = bpy.data.collections["LP"].objects
+        lp_objects = scene.smart_bake_lp_collection.objects
         missing_uv_objects = []
 
         for obj in lp_objects:
@@ -222,12 +233,12 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
 
         # === Step 1: MERGING LOW-POLY (LP) ===
         self.report({'INFO'}, "Processing and merging Low-Poly collection...")
-        merged_lp = self._prepare_and_merge_collection(context, "LP", self.MERGED_LP_NAME)
+        merged_lp = self._prepare_and_merge_collection(context, scene.smart_bake_lp_collection, self.MERGED_LP_NAME)
 
 
         # === STEP 2: MERGING HIGH-POLY (HP) ===
         self.report({'INFO'}, "Processing and merging High-Poly collection...")
-        merged_hp = self._prepare_and_merge_collection(context, "HP", self.MERGED_HP_NAME)
+        merged_hp = self._prepare_and_merge_collection(context, scene.smart_bake_hp_collection, self.MERGED_HP_NAME)
         
 
         # === STEP 3: PREPARE SELECTED TO ACTIVE ===
@@ -297,7 +308,7 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
 
         # === STEP 4: CYCLES CONFIGURATION ===
         self.report({'INFO'}, "Geometry ready. Preparing Cycles...")
-        scene = context.scene
+        
         render_settings = scene.render
         cycles_settings = scene.cycles
         
@@ -326,33 +337,47 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         # --- Pass 1: SMOOTH NORMAL (For bevels) ---
         self.report({'INFO'}, "Pass 1 Start: Smooth Normal Baking...")
         
-        # Переконуємося, що Low-Poly меш має Smooth затінення
-        bpy.ops.object.shade_smooth()
+        # bpy.ops.object.shade_smooth()
+        # Low-level Python loop to force Smooth shading directly in memory
+        for poly in merged_lp.data.polygons:
+            poly.use_smooth = True
+        merged_lp.data.update() # Flush data changes to database
+
         
         # Робимо активною ноду Smooth текстури
         bake_mat.node_tree.nodes.active = self.node_smooth_ref
         self.node_smooth_ref.select = True
         
-        # Викликаємо вбудований бейк Блендера (код засинає, поки Cycles рендерить)
-        bpy.ops.object.bake(type='NORMAL')
+        # Execute bake inside a safe context override wrapper
+        with context.temp_override(active_object=merged_lp, selected_objects=[merged_hp, merged_lp]):
+            bpy.ops.object.bake(type='NORMAL')
         
         
         # --- PASS 2: FLAT NORMAL (for normal correction) ---
         self.report({'INFO'}, "Pass 2 Start: Flat Normal Baking...")
         
         # Temporarily switch merged Low-Poly to Flat Shading
-        bpy.ops.object.shade_flat()
+        # bpy.ops.object.shade_flat()
+        # Low-level Python loop to force Flat shading directly in memory
+        for poly in merged_lp.data.polygons:
+            poly.use_smooth = False
+        merged_lp.data.update()
         
         # Activate Flat texture node
         bake_mat.node_tree.nodes.active = self.node_flat_ref
         self.node_flat_ref.select = True
         
-        # Run second bake pass
-        bpy.ops.object.bake(type='NORMAL')
+        # Execute second bake pass safely
+        with context.temp_override(active_object=merged_lp, selected_objects=[merged_hp, merged_lp]):
+            bpy.ops.object.bake(type='NORMAL')
         
         
         # Reset shading state back to smooth
-        bpy.ops.object.shade_smooth()
+        # bpy.ops.object.shade_smooth()
+        # Restore default Smooth shading state back via low-level API
+        for poly in merged_lp.data.polygons:
+            poly.use_smooth = True
+        merged_lp.data.update()
         
         # Робимо активною ноду маски, щоб користувач міг одразу малювати
         bake_mat.node_tree.nodes.active = self.node_mask_ref
@@ -423,13 +448,21 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         self.report({'INFO'}, "Hiding input LP and HP collections...")
         
         # Get the root layer collection of the current view layer
-        root_layer_col = context.view_layer.layer_collection
+        # root_layer_col = context.view_layer.layer_collection
         
         # Loop through all sub-collections in the view layer
-        for sub_layer_col in root_layer_col.children:
-            # If the collection name matches LP or HP, exclude it from the view layer
-            if sub_layer_col.name in {"LP", "HP"}:
-                sub_layer_col.exclude = True                        
+        # for sub_layer_col in root_layer_col.children:
+        #     # If the collection name matches LP or HP, exclude it from the view layer
+        #     if sub_layer_col.name in {"LP", "HP"}:
+        #         sub_layer_col.exclude = True   
+
+        children = context.view_layer.layer_collection.children
+        
+        # Instantly access and exclude layer collections via their names from pointers
+        if scene.smart_bake_lp_collection:
+            children.get(scene.smart_bake_lp_collection.name).exclude = True
+        if scene.smart_bake_hp_collection:
+            children.get(scene.smart_bake_hp_collection.name).exclude = True
 
         self.report({'INFO'}, "Baking finished!")
         return {'FINISHED'}
@@ -500,45 +533,46 @@ class OBJECT_OT_activate_skew_paint(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class OBJECT_OT_create_collection(bpy.types.Operator):
-    "Create collection from selected"
-    bl_idname = "object.create_collection"
-    bl_label = "Create Collection"
-    bl_options = {"REGISTER", "UNDO"}
+# TODO: remove operator?
+# class OBJECT_OT_create_collection(bpy.types.Operator):
+#     "Create collection from selected"
+#     bl_idname = "object.create_collection"
+#     bl_label = "Create Collection"
+#     bl_options = {"REGISTER", "UNDO"}
 
-    col_name: bpy.props.StringProperty(default="LP")
+#     col_name: bpy.props.StringProperty(default="LP")
 
-    @classmethod
-    def poll(cls, context): 
-        return context.mode == 'OBJECT'
+#     @classmethod
+#     def poll(cls, context): 
+#         return context.mode == 'OBJECT'
 
-    def execute(self, context):
-        selected_objs = context.selected_objects
+#     def execute(self, context):
+#         selected_objs = context.selected_objects
 
-        if not selected_objs:
-            self.report({'WARNING'}, "No selected objects!")
-            return {'CANCELLED'}
-        name = self.col_name
+#         if not selected_objs:
+#             self.report({'WARNING'}, "No selected objects!")
+#             return {'CANCELLED'}
+#         name = self.col_name
 
-        # Check if collection exist, else create new
-        if name in bpy.data.collections:
-            target_col = bpy.data.collections[name]
-        else:
-            target_col = bpy.data.collections.new(name)
-            context.scene.collection.children.link(target_col)
+#         # Check if collection exist, else create new
+#         if name in bpy.data.collections:
+#             target_col = bpy.data.collections[name]
+#         else:
+#             target_col = bpy.data.collections.new(name)
+#             context.scene.collection.children.link(target_col)
        
-        # Transfer each selected object
-        for obj in selected_objs:
-            # Check if object is not linked to target
-            if obj.name not in target_col.objects:
-                target_col.objects.link(obj)
-                # Safely delete from old collections
-                for old_col in list(obj.users_collection):
-                    if old_col != target_col:
-                        old_col.objects.unlink(obj)
+#         # Transfer each selected object
+#         for obj in selected_objs:
+#             # Check if object is not linked to target
+#             if obj.name not in target_col.objects:
+#                 target_col.objects.link(obj)
+#                 # Safely delete from old collections
+#                 for old_col in list(obj.users_collection):
+#                     if old_col != target_col:
+#                         old_col.objects.unlink(obj)
             
-        self.report({'INFO'}, f"Added {len(selected_objs)} objects to collection {self.col_name}")
-        return {'FINISHED'}
+#         self.report({'INFO'}, f"Added {len(selected_objs)} objects to collection {self.col_name}")
+#         return {'FINISHED'}
         
 class OBJECT_OT_finalize_bake(bpy.types.Operator):
     """Merge maps based on paint mask, export final image to disk and clean up scene"""
@@ -676,11 +710,20 @@ class OBJECT_OT_finalize_bake(bpy.types.Operator):
         OBJECT_OT_bake_normals.cleanup_assets(context)
 
         # 5. RESTORE INPUT COLLECTIONS VISIBILITY
-        root_layer_col = context.view_layer.layer_collection
-        for sub_layer_col in root_layer_col.children:
-            if sub_layer_col.name in {"LP", "HP"}:
-                sub_layer_col.exclude = False
+        # root_layer_col = context.view_layer.layer_collection
+        # for sub_layer_col in root_layer_col.children:
+        #     if sub_layer_col.name in {"LP", "HP"}:
+        #         sub_layer_col.exclude = False
 
+        children = context.view_layer.layer_collection.children
+        
+        # Instantly restore visibility for original artist collections
+        if scene.smart_bake_lp_collection:
+            children.get(scene.smart_bake_lp_collection.name).exclude = False
+        if scene.smart_bake_hp_collection:
+            children.get(scene.smart_bake_hp_collection.name).exclude = False
+        
+        
         self.report({'INFO'}, f"Successfully saved final map as: {filename}.png")
         return {'FINISHED'}
 
@@ -698,28 +741,35 @@ class VIEW3D_PT_maps_panel(bpy.types.Panel):
         layout = self.layout
         scene = context.scene
         # Get collections data to print statistics
-        lp_col = bpy.data.collections.get("LP")
-        hp_col = bpy.data.collections.get("HP")
+        # lp_col = bpy.data.collections.get("LP")
+        # hp_col = bpy.data.collections.get("HP")
         
-        lp_count = len(lp_col.objects) if lp_col else 0
-        hp_count = len(hp_col.objects) if hp_col else 0
+        # lp_count = len(lp_col.objects) if lp_col else 0
+        # hp_count = len(hp_col.objects) if hp_col else 0
         layout.label(text="Models for Baking:")
+
+        box_slots = layout.box()
+        
+        # FIXED: Draw interactive collection selectors with pipettes instead of old assignment buttons
+        box_slots.prop(scene, "smart_bake_lp_collection", text="Low-Poly Collection", icon='MESH_ICOSPHERE')
+        box_slots.prop(scene, "smart_bake_hp_collection", text="High-Poly Collection", icon='MESH_MONKEY')
+        
 
         # Low-Poly button
         # row = layout.row(align=True)
-        op_lp = layout.operator(
-            "object.create_collection", 
-            text=f"Add to Low-Poly ({lp_count} pcs)", 
-            icon='MESH_ICOSPHERE')
-        op_lp.col_name = "LP" 
+        # op_lp = layout.operator(
+        #     "object.create_collection", 
+        #     text=f"Add to Low-Poly ({lp_count} pcs)", 
+        #     icon='MESH_ICOSPHERE')
+        # op_lp.col_name = "LP" 
 
         # High-Poly button
         # row = layout.row(align=True)
-        op_hp = layout.operator(
-            "object.create_collection", 
-            text=f"Add to High-Poly ({hp_count} pcs)", 
-            icon='MESH_MONKEY')
-        op_hp.col_name = "HP"
+        # op_hp = layout.operator(
+        #     "object.create_collection", 
+        #     text=f"Add to High-Poly ({hp_count} pcs)", 
+        #     icon='MESH_MONKEY')
+        # op_hp.col_name = "HP"
 
         layout.separator()
         # Baking Button
@@ -727,16 +777,33 @@ class VIEW3D_PT_maps_panel(bpy.types.Panel):
         # col = layout.column(align=True)
         
         layout.operator("object.bake_normals", text="Bake Normals", icon='MESH_MONKEY')
+
         # Context warning when button is inactive
-        if lp_count == 0 or hp_count == 0:
-            box = layout.box()
-            box.scale_y = 0.8
-            if lp_count == 0 and hp_count == 0:
-                box.label(text="Add objects to LP and HP!", icon='ERROR')
-            elif lp_count == 0:
-                box.label(text="Low-Poly collection (LP) is empty!", icon='ERROR')
-            elif hp_count == 0:
-                box.label(text="High-Poly collection (HP) is empty!", icon='ERROR')
+        # if lp_count == 0 or hp_count == 0:
+        #     box = layout.box()
+        #     box.scale_y = 0.8
+        #     if lp_count == 0 and hp_count == 0:
+        #         box.label(text="Add objects to LP and HP!", icon='ERROR')
+        #     elif lp_count == 0:
+        #         box.label(text="Low-Poly collection (LP) is empty!", icon='ERROR')
+        #     elif hp_count == 0:
+        #         box.label(text="High-Poly collection (HP) is empty!", icon='ERROR')
+
+        # FIXED: Context warning checks now use the data pointers instead of hardcoded string searches
+        lp_col = scene.smart_bake_lp_collection
+        hp_col = scene.smart_bake_hp_collection
+        
+        if not lp_col or not hp_col or not lp_col.objects or not hp_col.objects:
+            box_warn = layout.box()
+            box_warn.scale_y = 0.8
+            if not lp_col and not hp_col:
+                box_warn.label(text="Assign LP and HP collections!", icon='ERROR')
+            elif not lp_col or not lp_col.objects:
+                box_warn.label(text="Low-Poly collection is empty or unassigned!", icon='ERROR')
+            elif not hp_col or not hp_col.objects:
+                box_warn.label(text="High-Poly collection is empty or unassigned!", icon='ERROR')
+                
+                
         merged_lp_exists = bpy.data.objects.get(OBJECT_OT_bake_normals.MERGED_LP_NAME) is not None
         
         if merged_lp_exists:
@@ -759,7 +826,7 @@ class VIEW3D_PT_maps_panel(bpy.types.Panel):
 
 
 classes = [VIEW3D_PT_maps_panel, 
-           OBJECT_OT_create_collection, 
+        #    OBJECT_OT_create_collection, 
            OBJECT_OT_bake_normals,
            OBJECT_OT_activate_skew_paint,
            OBJECT_OT_finalize_bake,]
@@ -791,6 +858,17 @@ def register():
         name="DirectX (-Y)",
         description="Invert the Green channel to match DirectX normal map format standards",
         default=False
+    )
+    # Register safe data pointers for target collections instead of hardcoded strings
+    bpy.types.Scene.smart_bake_lp_collection = bpy.props.PointerProperty(
+        type=bpy.types.Collection,
+        name="Low-Poly",
+        description="Select the collection containing Low-Poly objects"
+    )
+    bpy.types.Scene.smart_bake_hp_collection = bpy.props.PointerProperty(
+        type=bpy.types.Collection,
+        name="High-Poly",
+        description="Select the collection containing High-Poly objects"
     )   
 
 
@@ -801,3 +879,5 @@ def unregister():
     del bpy.types.Scene.smart_bake_extrusion
     del bpy.types.Scene.smart_bake_filename
     del bpy.types.Scene.smart_bake_directx
+    del bpy.types.Scene.smart_bake_lp_collection
+    del bpy.types.Scene.smart_bake_hp_collection
