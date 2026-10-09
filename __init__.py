@@ -74,13 +74,25 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
     @classmethod
     def cleanup_assets(cls, context, clean_geometry=True, clean_materials=True, clean_textures=True):
         """Safely removes temporary baking assets from Blender database"""
+        scene = context.scene
         
         # 1. Clean up temporary meshes and objects
         if clean_geometry:
-            for name in [cls.MERGED_LP_NAME, cls.MERGED_HP_NAME]:
-                obj = bpy.data.objects.get(name)
+            # Safely extract references to memory blocks
+            lp_obj = scene.smart_bake_merged_lp_obj
+            hp_obj = scene.smart_bake_merged_hp_obj
+            
+            for obj in [lp_obj, hp_obj]:
                 if obj:
                     cls.delete_object(obj)
+            
+            # Clear pointers from scene database to mark them empty
+            scene.smart_bake_merged_lp_obj = None
+            scene.smart_bake_merged_hp_obj = None
+            # for name in [cls.MERGED_LP_NAME, cls.MERGED_HP_NAME]:
+            #     obj = bpy.data.objects.get(name)
+            #     if obj:
+            #         cls.delete_object(obj)
 
         # 2. Clean up temporary material
         if clean_materials:
@@ -234,12 +246,13 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         # === Step 1: MERGING LOW-POLY (LP) ===
         self.report({'INFO'}, "Processing and merging Low-Poly collection...")
         merged_lp = self._prepare_and_merge_collection(context, scene.smart_bake_lp_collection, self.MERGED_LP_NAME)
+        scene.smart_bake_merged_lp_obj = merged_lp
 
 
         # === STEP 2: MERGING HIGH-POLY (HP) ===
         self.report({'INFO'}, "Processing and merging High-Poly collection...")
         merged_hp = self._prepare_and_merge_collection(context, scene.smart_bake_hp_collection, self.MERGED_HP_NAME)
-        
+        scene.smart_bake_merged_hp_obj = merged_hp
 
         # === STEP 3: PREPARE SELECTED TO ACTIVE ===
         # Для запікання Selected to Active: High-Poly має бути ВИДІЛЕНИМ,
@@ -480,11 +493,13 @@ class OBJECT_OT_activate_skew_paint(bpy.types.Operator):
         # TODO: check for mask and Normal texture existance?
         if not context.mode == 'OBJECT':
             return False
-        return bpy.data.objects.get(OBJECT_OT_bake_normals.MERGED_LP_NAME) is not None
+        # return bpy.data.objects.get(OBJECT_OT_bake_normals.MERGED_LP_NAME) is not None
+        return context.scene.smart_bake_merged_lp_obj is not None
 
     def execute(self, context):
-        merged_lp = bpy.data.objects.get(OBJECT_OT_bake_normals.MERGED_LP_NAME)
-        
+        # merged_lp = bpy.data.objects.get(OBJECT_OT_bake_normals.MERGED_LP_NAME)
+        merged_lp = context.scene.smart_bake_merged_lp_obj
+
         if not merged_lp:
             self.report({'WARNING'}, "Temporary bake mesh not found!")
             return {'CANCELLED'}
@@ -583,7 +598,8 @@ class OBJECT_OT_finalize_bake(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         # Active only if the temporary low-poly bake mesh exists in the scene
-        return bpy.data.objects.get(OBJECT_OT_bake_normals.MERGED_LP_NAME) is not None
+        # return bpy.data.objects.get(OBJECT_OT_bake_normals.MERGED_LP_NAME) is not None
+        return context.scene.smart_bake_merged_lp_obj is not None
 
     def execute(self, context):
         scene = context.scene
@@ -602,7 +618,9 @@ class OBJECT_OT_finalize_bake(bpy.types.Operator):
         self.report({'INFO'}, "Compiling and exporting final combined map...")
 
         # === 1. ACCESS THE INTERNAL MATERIAL AND CONNECT MIX TO EMISSION ===
-        merged_lp = bpy.data.objects.get(OBJECT_OT_bake_normals.MERGED_LP_NAME)
+        # merged_lp = bpy.data.objects.get(OBJECT_OT_bake_normals.MERGED_LP_NAME)
+        merged_lp = scene.smart_bake_merged_lp_obj
+        
         if not merged_lp or not merged_lp.data.materials:
             self.report({'ERROR'}, "Temporary bake mesh or material missing!")
             return {'CANCELLED'}
@@ -804,8 +822,9 @@ class VIEW3D_PT_maps_panel(bpy.types.Panel):
                 box_warn.label(text="High-Poly collection is empty or unassigned!", icon='ERROR')
                 
                 
-        merged_lp_exists = bpy.data.objects.get(OBJECT_OT_bake_normals.MERGED_LP_NAME) is not None
+        # merged_lp_exists = bpy.data.objects.get(OBJECT_OT_bake_normals.MERGED_LP_NAME) is not None
         
+        merged_lp_exists = scene.smart_bake_merged_lp_obj is not None
         if merged_lp_exists:
             layout.separator()
             # Highlights the button in blue/accent color to draw user's attention
@@ -869,7 +888,16 @@ def register():
         type=bpy.types.Collection,
         name="High-Poly",
         description="Select the collection containing High-Poly objects"
-    )   
+    )
+    # Register safe scene memory pointers for temporary baking meshes
+    bpy.types.Scene.smart_bake_merged_lp_obj = bpy.props.PointerProperty(
+        type=bpy.types.Object,
+        name="Merged Low-Poly Object"
+    )
+    bpy.types.Scene.smart_bake_merged_hp_obj = bpy.props.PointerProperty(
+        type=bpy.types.Object,
+        name="Merged High-Poly Object"
+    )  
 
 
 def unregister():
