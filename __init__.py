@@ -75,20 +75,21 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
     def cleanup_assets(cls, context, clean_geometry=True, clean_materials=True, clean_textures=True):
         """Safely removes temporary baking assets from Blender database"""
         scene = context.scene
+        settings = scene.smart_bake_settings
         
         # 1. Clean up temporary meshes and objects
         if clean_geometry:
             # Safely extract references to memory blocks
-            lp_obj = scene.smart_bake_merged_lp_obj
-            hp_obj = scene.smart_bake_merged_hp_obj
+            lp_obj = settings.merged_lp_obj
+            hp_obj = settings.merged_hp_obj
             
             for obj in [lp_obj, hp_obj]:
                 if obj:
                     cls.delete_object(obj)
             
             # Clear pointers from scene database to mark them empty
-            scene.smart_bake_merged_lp_obj = None
-            scene.smart_bake_merged_hp_obj = None
+            settings.merged_lp_obj = None
+            settings.merged_hp_obj = None
             # for name in [cls.MERGED_LP_NAME, cls.MERGED_HP_NAME]:
             #     obj = bpy.data.objects.get(name)
             #     if obj:
@@ -127,10 +128,13 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         #     return False
 
         scene = context.scene
+        if not hasattr(scene, "smart_bake_settings"):
+            return False
+        settings = scene.smart_bake_settings
         # FIXED: Access references directly from Scene data model
-        lp_col = scene.smart_bake_lp_collection
-        hp_col = scene.smart_bake_hp_collection
-        
+        lp_col = settings.lp_collection
+        hp_col = settings.hp_collection
+
         if not lp_col or not lp_col.objects:
             return False
         if not hp_col or not hp_col.objects:
@@ -185,6 +189,11 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
                 # obj_copy = context.view_layer.objects.active
                 # duplicates.append(obj_copy)
 
+                # ВИПРАВЛЕНО: Негайно видаляємо копію з бази Blender, 
+                # щоб вона не висіла «мертвим вантажем» у пам'яті
+                bpy.data.meshes.remove(mesh_copy, do_unlink=True)
+                bpy.data.meshes.remove(mesh_from_eval, do_unlink=True)
+
         # Convert the bmesh to the new mesh
         bm.to_mesh(new_mesh)
         # Link the new object to the scene and select it
@@ -209,13 +218,14 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
     def execute(self, context):
         start_time = time.time()
         scene = context.scene
+        settings = scene.smart_bake_settings
         # Run pre-bake cleanup to wipe any leftovers from previous sessions
         self.report({'INFO'}, "Performing pre-bake cleanup...")
         self.cleanup_assets(context)
         self.report({'INFO'}, f"Cleanup complete in {time.time() - start_time:.2f}s.")
         
         # === Step 0: UV MAPS VALIDATION ON LOW-POLY ===
-        lp_objects = scene.smart_bake_lp_collection.objects
+        lp_objects = settings.lp_collection.objects
         missing_uv_objects = []
 
         for obj in lp_objects:
@@ -245,14 +255,14 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
 
         # === Step 1: MERGING LOW-POLY (LP) ===
         self.report({'INFO'}, "Processing and merging Low-Poly collection...")
-        merged_lp = self._prepare_and_merge_collection(context, scene.smart_bake_lp_collection, self.MERGED_LP_NAME)
-        scene.smart_bake_merged_lp_obj = merged_lp
+        merged_lp = self._prepare_and_merge_collection(context, settings.lp_collection, self.MERGED_LP_NAME)
+        settings.merged_lp_obj = merged_lp
 
 
         # === STEP 2: MERGING HIGH-POLY (HP) ===
         self.report({'INFO'}, "Processing and merging High-Poly collection...")
-        merged_hp = self._prepare_and_merge_collection(context, scene.smart_bake_hp_collection, self.MERGED_HP_NAME)
-        scene.smart_bake_merged_hp_obj = merged_hp
+        merged_hp = self._prepare_and_merge_collection(context, settings.hp_collection, self.MERGED_HP_NAME)
+        settings.merged_hp_obj = merged_hp
 
         # === STEP 3: PREPARE SELECTED TO ACTIVE ===
         # Для запікання Selected to Active: High-Poly має бути ВИДІЛЕНИМ,
@@ -267,7 +277,7 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         self.report({'INFO'}, "Texture generation...")
 
         # Получаем выбранное пользователем разрешение из настроек сцены
-        res = int(context.scene.smart_bake_resolution)
+        res = int(settings.resolution)
         
         # Creating textures in Blender DB
         tex_smooth_name = self.TEX_SMOOTH_NAME # "T_Bake_Normal_Smooth"
@@ -340,7 +350,7 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         
         # Отримуємо значення Extrusion з повзунка нашої панелі (створимо його на наступному кроці)
         bake_settings.margin = 16  # Падінг текстури (Margin) за замовчуванням 16 пікселів
-        bake_settings.cage_extrusion = scene.smart_bake_extrusion
+        bake_settings.cage_extrusion = settings.extrusion
         
         # Залишаємо Max Ray Distance в 0 (нескінченність), щоб Cycles сам знаходив хай-полі
         bake_settings.max_ray_distance = 0.0
@@ -472,10 +482,10 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         children = context.view_layer.layer_collection.children
         
         # Instantly access and exclude layer collections via their names from pointers
-        if scene.smart_bake_lp_collection:
-            children.get(scene.smart_bake_lp_collection.name).exclude = True
-        if scene.smart_bake_hp_collection:
-            children.get(scene.smart_bake_hp_collection.name).exclude = True
+        if settings.lp_collection:
+            children.get(settings.lp_collection.name).exclude = True
+        if settings.hp_collection:
+            children.get(settings.hp_collection.name).exclude = True
 
         self.report({'INFO'}, "Baking finished!")
         return {'FINISHED'}
@@ -494,11 +504,11 @@ class OBJECT_OT_activate_skew_paint(bpy.types.Operator):
         if not context.mode == 'OBJECT':
             return False
         # return bpy.data.objects.get(OBJECT_OT_bake_normals.MERGED_LP_NAME) is not None
-        return context.scene.smart_bake_merged_lp_obj is not None
+        return context.scene.smart_bake_settings.merged_lp_obj is not None
 
     def execute(self, context):
         # merged_lp = bpy.data.objects.get(OBJECT_OT_bake_normals.MERGED_LP_NAME)
-        merged_lp = context.scene.smart_bake_merged_lp_obj
+        merged_lp = context.scene.smart_bake_settings.merged_lp_obj
 
         if not merged_lp:
             self.report({'WARNING'}, "Temporary bake mesh not found!")
@@ -599,12 +609,13 @@ class OBJECT_OT_finalize_bake(bpy.types.Operator):
     def poll(cls, context):
         # Active only if the temporary low-poly bake mesh exists in the scene
         # return bpy.data.objects.get(OBJECT_OT_bake_normals.MERGED_LP_NAME) is not None
-        return context.scene.smart_bake_merged_lp_obj is not None
+        return context.scene.smart_bake_settings.merged_lp_obj is not None
 
     def execute(self, context):
         scene = context.scene
-        filename = scene.smart_bake_filename
-        res = int(scene.smart_bake_resolution)
+        settings = scene.smart_bake_settings
+        filename = settings.filename
+        res = int(settings.resolution)
 
         # Ensure the .blend project file is saved to resolve the disk path
         if not bpy.data.is_saved:
@@ -619,7 +630,7 @@ class OBJECT_OT_finalize_bake(bpy.types.Operator):
 
         # === 1. ACCESS THE INTERNAL MATERIAL AND CONNECT MIX TO EMISSION ===
         # merged_lp = bpy.data.objects.get(OBJECT_OT_bake_normals.MERGED_LP_NAME)
-        merged_lp = scene.smart_bake_merged_lp_obj
+        merged_lp = settings.merged_lp_obj
         
         if not merged_lp or not merged_lp.data.materials:
             self.report({'ERROR'}, "Temporary bake mesh or material missing!")
@@ -658,7 +669,7 @@ class OBJECT_OT_finalize_bake(bpy.types.Operator):
         node_final_target.select = True
 
         # Check if the DirectX normal map output format is requested by the artist
-        if scene.smart_bake_directx:
+        if settings.directx:
             # Create math and vector nodes to dynamically invert the Green channel vector on the fly
             node_sep = nodes.new(type='ShaderNodeSeparateColor')
             node_comb = nodes.new(type='ShaderNodeCombineColor')
@@ -736,10 +747,10 @@ class OBJECT_OT_finalize_bake(bpy.types.Operator):
         children = context.view_layer.layer_collection.children
         
         # Instantly restore visibility for original artist collections
-        if scene.smart_bake_lp_collection:
-            children.get(scene.smart_bake_lp_collection.name).exclude = False
-        if scene.smart_bake_hp_collection:
-            children.get(scene.smart_bake_hp_collection.name).exclude = False
+        if settings.lp_collection:
+            children.get(settings.lp_collection.name).exclude = False
+        if settings.hp_collection:
+            children.get(settings.hp_collection.name).exclude = False
         
         
         self.report({'INFO'}, f"Successfully saved final map as: {filename}.png")
@@ -769,8 +780,8 @@ class VIEW3D_PT_maps_panel(bpy.types.Panel):
         box_slots = layout.box()
         
         # FIXED: Draw interactive collection selectors with pipettes instead of old assignment buttons
-        box_slots.prop(scene, "smart_bake_lp_collection", text="Low-Poly Collection", icon='MESH_ICOSPHERE')
-        box_slots.prop(scene, "smart_bake_hp_collection", text="High-Poly Collection", icon='MESH_MONKEY')
+        box_slots.prop(scene.smart_bake_settings, "lp_collection", text="Low-Poly Collection", icon='MESH_ICOSPHERE')
+        box_slots.prop(scene.smart_bake_settings, "hp_collection", text="High-Poly Collection", icon='MESH_MONKEY')
         
 
         # Low-Poly button
@@ -808,8 +819,8 @@ class VIEW3D_PT_maps_panel(bpy.types.Panel):
         #         box.label(text="High-Poly collection (HP) is empty!", icon='ERROR')
 
         # FIXED: Context warning checks now use the data pointers instead of hardcoded string searches
-        lp_col = scene.smart_bake_lp_collection
-        hp_col = scene.smart_bake_hp_collection
+        lp_col = scene.smart_bake_settings.lp_collection
+        hp_col = scene.smart_bake_settings.hp_collection
         
         if not lp_col or not hp_col or not lp_col.objects or not hp_col.objects:
             box_warn = layout.box()
@@ -824,7 +835,7 @@ class VIEW3D_PT_maps_panel(bpy.types.Panel):
                 
         # merged_lp_exists = bpy.data.objects.get(OBJECT_OT_bake_normals.MERGED_LP_NAME) is not None
         
-        merged_lp_exists = scene.smart_bake_merged_lp_obj is not None
+        merged_lp_exists = scene.smart_bake_settings.merged_lp_obj is not None
         if merged_lp_exists:
             layout.separator()
             # Highlights the button in blue/accent color to draw user's attention
@@ -834,18 +845,66 @@ class VIEW3D_PT_maps_panel(bpy.types.Panel):
         layout.separator()
         layout.label(text="Texture settings:")
         # Add the text field property for user-defined texture name
-        layout.prop(scene, "smart_bake_filename", text="Name")
-        layout.prop(scene, "smart_bake_resolution", text="Resolution")
+        layout.prop(scene.smart_bake_settings, "filename", text="Name")
+        layout.prop(scene.smart_bake_settings, "resolution", text="Resolution")
         # Expose the DirectX format checkbox toggler right in the settings sub-layout
-        layout.prop(scene, "smart_bake_directx", text="DirectX")
+        layout.prop(scene.smart_bake_settings, "directx", text="DirectX")
         
-        layout.prop(scene, "smart_bake_extrusion", text="Ray Height")
+        layout.prop(scene.smart_bake_settings, "extrusion", text="Ray Height")
 
 
+                  
+# =======================================================================
+#  CENTRALIZED PROPERTY DATA CONTAINER (PropertyGroup)
+# =======================================================================
+class SmartBakerSettings(bpy.types.PropertyGroup):
+    """Holds all properties for the baking tool in a single scene property container"""
+
+    resolution: bpy.props.EnumProperty(
+        items=texture_res_items,
+        name="Resolution",
+        default='2048'
+    )
+    extrusion: bpy.props.FloatProperty(
+        name="Ray Offset (Extrusion)",
+        description="Ray Height for selected to active baking",
+        default=0.05,  
+        min=0.0,
+        max=10.0,
+        subtype='DISTANCE'
+    )
+    filename: bpy.props.StringProperty(
+        name="File Name",
+        description="Base name for the generated baking textures",
+        default="T_Model_Normal"
+    )
+    directx: bpy.props.BoolProperty(
+        name="DirectX (-Y)",
+        description="Invert the Green channel to match DirectX normal map format standards",
+        default=False
+    )
+    lp_collection: bpy.props.PointerProperty(
+        type=bpy.types.Collection,
+        name="Low-Poly",
+        description="Select the collection containing Low-Poly objects"
+    )
+    hp_collection: bpy.props.PointerProperty(
+        type=bpy.types.Collection,
+        name="High-Poly",
+        description="Select the collection containing High-Poly objects"
+    )
+    merged_lp_obj: bpy.props.PointerProperty(
+        type=bpy.types.Object,
+        name="Merged Low-Poly Object"
+    )
+    merged_hp_obj: bpy.props.PointerProperty(
+        type=bpy.types.Object,
+        name="Merged High-Poly Object"
+    )
 
 
-classes = [VIEW3D_PT_maps_panel, 
-        #    OBJECT_OT_create_collection, 
+classes = [SmartBakerSettings,
+           VIEW3D_PT_maps_panel, 
            OBJECT_OT_bake_normals,
            OBJECT_OT_activate_skew_paint,
            OBJECT_OT_finalize_bake,]
@@ -853,59 +912,10 @@ classes = [VIEW3D_PT_maps_panel,
 def register():
     for cls in classes:
         bpy.utils.register_class(cls)
-    bpy.types.Scene.smart_bake_resolution = bpy.props.EnumProperty(
-        items=texture_res_items,
-        name="Resolution",
-        default='2048'
-    )
-    bpy.types.Scene.smart_bake_extrusion = bpy.props.FloatProperty(
-        name="Ray Offset (Extrusion)",
-        description="Ray Height",
-        default=0.05,  
-        min=0.0,
-        max=10.0,
-        subtype='DISTANCE' # Show units of measurement
-    )
-    # Register custom text property for file naming
-    bpy.types.Scene.smart_bake_filename = bpy.props.StringProperty(
-        name="File Name",
-        description="Base name for the generated baking textures",
-        default="T_Model_Normal"
-    )
-    # Register the DirectX normal map format option flag
-    bpy.types.Scene.smart_bake_directx = bpy.props.BoolProperty(
-        name="DirectX (-Y)",
-        description="Invert the Green channel to match DirectX normal map format standards",
-        default=False
-    )
-    # Register safe data pointers for target collections instead of hardcoded strings
-    bpy.types.Scene.smart_bake_lp_collection = bpy.props.PointerProperty(
-        type=bpy.types.Collection,
-        name="Low-Poly",
-        description="Select the collection containing Low-Poly objects"
-    )
-    bpy.types.Scene.smart_bake_hp_collection = bpy.props.PointerProperty(
-        type=bpy.types.Collection,
-        name="High-Poly",
-        description="Select the collection containing High-Poly objects"
-    )
-    # Register safe scene memory pointers for temporary baking meshes
-    bpy.types.Scene.smart_bake_merged_lp_obj = bpy.props.PointerProperty(
-        type=bpy.types.Object,
-        name="Merged Low-Poly Object"
-    )
-    bpy.types.Scene.smart_bake_merged_hp_obj = bpy.props.PointerProperty(
-        type=bpy.types.Object,
-        name="Merged High-Poly Object"
-    )  
+    bpy.types.Scene.smart_bake_settings = bpy.props.PointerProperty(type=SmartBakerSettings) 
 
 
 def unregister():
     for cls in classes:
         bpy.utils.unregister_class(cls)
-    del bpy.types.Scene.smart_bake_resolution
-    del bpy.types.Scene.smart_bake_extrusion
-    del bpy.types.Scene.smart_bake_filename
-    del bpy.types.Scene.smart_bake_directx
-    del bpy.types.Scene.smart_bake_lp_collection
-    del bpy.types.Scene.smart_bake_hp_collection
+    del bpy.types.Scene.smart_bake_settings
