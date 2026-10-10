@@ -624,7 +624,7 @@ class OBJECT_OT_finalize_bake(bpy.types.Operator):
         
         self.report({'INFO'}, "Blending textures directly in RAM...")
 
-        # 1. Retrieve the baked texture maps from the Blender database
+                # 1. Retrieve the baked texture maps from the Blender database
         img_smooth = bpy.data.images.get(OBJECT_OT_bake_normals.TEX_SMOOTH_NAME)
         img_flat = bpy.data.images.get(OBJECT_OT_bake_normals.TEX_FLAT_NAME)
         img_mask = bpy.data.images.get(OBJECT_OT_bake_normals.TEX_MASK_NAME)
@@ -633,48 +633,54 @@ class OBJECT_OT_finalize_bake(bpy.types.Operator):
             self.report({'ERROR'}, "Baking source textures missing from database!")
             return {'CANCELLED'}
 
-        # 2. Extract raw pixel buffers into memory arrays (flat lists of floats)
-        pixels_smooth = list(img_smooth.pixels)
-        pixels_flat = list(img_flat.pixels)
-        pixels_mask = list(img_mask.pixels)
+        import numpy as np
+
+        # 2. Fast block-read pixels into 1D float32 numpy arrays directly from C-buffer
+        arr_smooth = np.empty(res * res * 4, dtype=np.float32)
+        img_smooth.pixels.foreach_get(arr_smooth)
+
+        arr_flat = np.empty(res * res * 4, dtype=np.float32)
+        img_flat.pixels.foreach_get(arr_flat)
+
+        arr_mask = np.empty(res * res * 4, dtype=np.float32)
+        img_mask.pixels.foreach_get(arr_mask)
+
+        # 3. Reshape flat arrays to (Pixel_Count, Channels) to decouple components
+        # This gives us instant access to individual channels without heavy loops
+        smooth_rgb = arr_smooth.reshape(-1, 4)[:, :3]
+        flat_rgb = arr_flat.reshape(-1, 4)[:, :3]
         
-        total_values = res * res * 4
-        pixels_final = [1.0] * total_values # Pre-allocate memory buffer for RGBA channels
+        # Extract the factor from the Red channel of the paint mask texture
+        factor = arr_mask.reshape(-1, 4)[:, 0:1]  # Shape: (Pixel_Count, 1) for automated broadcasting
 
-        # 3. Vectorized mathematical blending loop execution
-        is_directx = props.directx
+        # 4. Perform instantaneous C-level vectorized linear interpolation (Lerp)
+        # Formula: Smooth * (1.0 - Factor) + Flat * Factor
+        final_rgb = smooth_rgb * (1.0 - factor) + flat_rgb * factor
+
+        # 5. Handle DirectX format axis inversion (-Y standard) in a single vectorized pass
+        if props.directx:
+            # Invert only the Green channel (index 1) across all pixels instantly
+            final_rgb[:, 1] = 1.0 - final_rgb[:, 1]
+
+        # 6. Reconstruct the flat 1D RGBA float32 array required by Blender API
+        arr_final = np.empty(res * res * 4, dtype=np.float32)
+        final_rgba = arr_final.reshape(-1, 4)
         
-        for i in range(0, total_values, 4):
-            # Read alpha-independent factor from the Red channel of the paint mask texture
-            factor = pixels_mask[i] 
-            inv_factor = 1.0 - factor
+        final_rgba[:, :3] = final_rgb
+        final_rgba[:, 3] = 1.0  # Force absolute opacity, eliminating world backdrop alpha leaks
 
-            # Linear interpolation (Lerp): A * (1 - t) + B * t
-            r = (pixels_smooth[i] * inv_factor) + (pixels_flat[i] * factor)
-            g = (pixels_smooth[i+1] * inv_factor) + (pixels_flat[i+1] * factor)
-            b = (pixels_smooth[i+2] * inv_factor) + (pixels_flat[i+2] * factor)
-
-            # Invert the Green channel on the fly if DirectX output standard is requested
-            if is_directx:
-                g = 1.0 - g
-
-            # Commit the mixed components back into the master output buffer
-            pixels_final[i]     = r
-            pixels_final[i+1]   = g
-            pixels_final[i+2]   = b
-            pixels_final[i+3]   = 1.0 # Force full opacity, eliminating world alpha background bugs
-
-        # 4. Create target asset and flush data arrays back into database space
+        # 7. Create target asset and flush data blocks back via fast memory transfer
         final_img = bpy.data.images.new(name="T_SmartBake_Final", width=res, height=res, alpha=False)
         final_img.colorspace_settings.name = 'Non-Color'
-        final_img.pixels = pixels_final
+        final_img.pixels.foreach_set(arr_final)
 
-        # 5. Export directly to disk bypassing any scene color management profiles
+        # 8. Export directly to disk bypassing scene color profiles
         final_img.filepath_raw = final_filepath
         final_img.file_format = 'PNG'
         final_img.save()
 
-        # 6. Database and garbage collection house-keeping
+
+        # Database and garbage collection house-keeping
         bpy.data.images.remove(final_img, do_unlink=True)
 
         if context.mode != 'OBJECT':
