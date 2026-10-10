@@ -600,161 +600,98 @@ class OBJECT_OT_activate_skew_paint(bpy.types.Operator):
 #         return {'FINISHED'}
         
 class OBJECT_OT_finalize_bake(bpy.types.Operator):
-    """Merge maps based on paint mask, export final image to disk and clean up scene"""
+    """Merge maps based on paint mask via RAM arrays, export final image and clean up scene"""
     bl_idname = "object.finalize_bake"
     bl_label = "Finalize & Export Map"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
     def poll(cls, context):
-        # Active only if the temporary low-poly bake mesh exists in the scene
-        # return bpy.data.objects.get(OBJECT_OT_bake_normals.MERGED_LP_NAME) is not None
         return context.scene.smart_bake_settings.merged_lp_obj is not None
 
     def execute(self, context):
-        scene = context.scene
-        settings = scene.smart_bake_settings
-        filename = settings.filename
-        res = int(settings.resolution)
+        start_time = time.time()
+        props = context.scene.smart_bake_settings
+        filename = props.filename
+        res = int(props.resolution)
 
-        # Ensure the .blend project file is saved to resolve the disk path
         if not bpy.data.is_saved:
             self.report({'ERROR'}, "Save your .blend file first to export textures!")
             return {'CANCELLED'}
             
-        # Get path of the current project directory and define final image path
         project_dir = bpy.path.abspath("//")
         final_filepath = os.path.join(project_dir, f"{filename}.png")
         
-        self.report({'INFO'}, "Compiling and exporting final combined map...")
+        self.report({'INFO'}, "Blending textures directly in RAM...")
 
-        # === 1. ACCESS THE INTERNAL MATERIAL AND CONNECT MIX TO EMISSION ===
-        # merged_lp = bpy.data.objects.get(OBJECT_OT_bake_normals.MERGED_LP_NAME)
-        merged_lp = settings.merged_lp_obj
-        
-        if not merged_lp or not merged_lp.data.materials:
-            self.report({'ERROR'}, "Temporary bake mesh or material missing!")
-            return {'CANCELLED'}
-            
-        bake_mat = merged_lp.data.materials.get(OBJECT_OT_bake_normals.MATERIAL_NAME)
-        if not bake_mat or not bake_mat.use_nodes:
-            self.report({'ERROR'}, "Bake material tree is broken!")
-            return {'CANCELLED'}
-            
-        nodes = bake_mat.node_tree.nodes
-        links = bake_mat.node_tree.links
-        
-        node_mix = None
-        material_output = None
-        
-        for n in nodes:
-            if n.type == 'MIX' and n.data_type == 'RGBA':
-                node_mix = n
-            elif n.type == 'OUTPUT_MATERIAL':
-                material_output = n
+        # 1. Retrieve the baked texture maps from the Blender database
+        img_smooth = bpy.data.images.get(OBJECT_OT_bake_normals.TEX_SMOOTH_NAME)
+        img_flat = bpy.data.images.get(OBJECT_OT_bake_normals.TEX_FLAT_NAME)
+        img_mask = bpy.data.images.get(OBJECT_OT_bake_normals.TEX_MASK_NAME)
 
-        if not node_mix or not material_output:
-            self.report({'ERROR'}, "Internal shader nodes logic missing!")
+        if not img_smooth or not img_flat or not img_mask:
+            self.report({'ERROR'}, "Baking source textures missing from database!")
             return {'CANCELLED'}
 
-        # Create a completely fresh, empty virtual image in memory for the final output
-        # Keep alpha=False as originally intended to avoid transparency bugs
-        final_img = bpy.data.images.new(name="T_SmartBake_Final_Render", width=res, height=res, alpha=False, float_buffer=False)
+        # 2. Extract raw pixel buffers into memory arrays (flat lists of floats)
+        pixels_smooth = list(img_smooth.pixels)
+        pixels_flat = list(img_flat.pixels)
+        pixels_mask = list(img_mask.pixels)
+        
+        total_values = res * res * 4
+        pixels_final = [1.0] * total_values # Pre-allocate memory buffer for RGBA channels
+
+        # 3. Vectorized mathematical blending loop execution
+        is_directx = props.directx
+        
+        for i in range(0, total_values, 4):
+            # Read alpha-independent factor from the Red channel of the paint mask texture
+            factor = pixels_mask[i] 
+            inv_factor = 1.0 - factor
+
+            # Linear interpolation (Lerp): A * (1 - t) + B * t
+            r = (pixels_smooth[i] * inv_factor) + (pixels_flat[i] * factor)
+            g = (pixels_smooth[i+1] * inv_factor) + (pixels_flat[i+1] * factor)
+            b = (pixels_smooth[i+2] * inv_factor) + (pixels_flat[i+2] * factor)
+
+            # Invert the Green channel on the fly if DirectX output standard is requested
+            if is_directx:
+                g = 1.0 - g
+
+            # Commit the mixed components back into the master output buffer
+            pixels_final[i]     = r
+            pixels_final[i+1]   = g
+            pixels_final[i+2]   = b
+            pixels_final[i+3]   = 1.0 # Force full opacity, eliminating world alpha background bugs
+
+        # 4. Create target asset and flush data arrays back into database space
+        final_img = bpy.data.images.new(name="T_SmartBake_Final", width=res, height=res, alpha=False)
         final_img.colorspace_settings.name = 'Non-Color'
+        final_img.pixels = pixels_final
 
-        # Create a temporary target texture node inside the material for Cycles to bake into
-        node_final_target = nodes.new(type='ShaderNodeTexImage')
-        node_final_target.image = final_img
-        nodes.active = node_final_target
-        node_final_target.select = True
-
-        # Check if the DirectX normal map output format is requested by the artist
-        if settings.directx:
-            # Create math and vector nodes to dynamically invert the Green channel vector on the fly
-            node_sep = nodes.new(type='ShaderNodeSeparateColor')
-            node_comb = nodes.new(type='ShaderNodeCombineColor')
-            node_inv_g = nodes.new(type='ShaderNodeMath')
-            
-            node_inv_g.operation = 'SUBTRACT'
-            node_inv_g.inputs[0].default_value = 1.0 # 1.0 - Green channel = Inverted Green channel
-            
-            # Create a network of links to reconstruct the color channels with inverted Y axis
-            links.new(node_mix.outputs['Result'], node_sep.inputs['Color'])
-            
-            # Pass Red and Blue channels directly untouched
-            links.new(node_sep.outputs['Red'], node_comb.inputs['Red'])
-            links.new(node_sep.outputs['Blue'], node_comb.inputs['Blue'])
-            
-            # Invert the Green channel vector mathematically
-            links.new(node_sep.outputs['Green'], node_inv_g.inputs[1])
-            links.new(node_inv_g.outputs['Value'], node_comb.inputs['Green'])
-            
-            # Connect the combined DirectX color stream to the material surface output socket
-            links.new(node_comb.outputs['Color'], material_output.inputs['Surface'])
-        else:
-            # Route the Mix Node directly into the Material Output's Surface input
-            links.new(node_mix.outputs['Result'], material_output.inputs['Surface'])
-
-        # === 2. RUN ULTRA-FAST BACKGROUND EMIT BAKE WITH TANGENT COLOR CLEAR ===
-        scene.render.engine = 'CYCLES'
-        scene.cycles.bake_samples = 1 
-        
-        bake_settings = scene.render.bake
-        bake_settings.use_selected_to_active = False 
-        
-        # Configure padding/margins for UV island edges
-        bake_settings.margin = 16
-        bake_settings.margin_type = 'EXTEND' 
-        
-        # FIXED: Disable image clearing before baking. 
-        # This keeps our pre-filled purple pixels intact in empty background spaces.
-        bake_settings.use_clear = False 
-
-        # 100% BULLETPROOF PYTHON PIXEL FILL
-        # This instantly floods the entire texture with the neutral normal purple color in RAM
-        neutral_normal_pixel = [0.5, 0.5, 1.0, 1.0] # RGBA
-        final_img.pixels = neutral_normal_pixel * (res * res)
-
-        # Execute background texture color calculation pass onto the pre-filled purple image
-        bpy.ops.object.bake(type='EMIT')
-
-        # === 3. CONFIGURE IMAGE FORMAT AND SAVE DIRECTLY TO HARD DRIVE ===
-        # Assign the path directly to the image object data block property
+        # 5. Export directly to disk bypassing any scene color management profiles
         final_img.filepath_raw = final_filepath
-        
-        # Setup output settings explicitly on the image itself
         final_img.file_format = 'PNG'
-        
-        # Use final_img.save() to write raw, untouched purple pixels directly to the disk.
         final_img.save()
 
-        # Remove our temporary render image block from database memory
+        # 6. Database and garbage collection house-keeping
         bpy.data.images.remove(final_img, do_unlink=True)
 
-        # === 4. SCENE CLEANUP AND RESET ===
         if context.mode != 'OBJECT':
             bpy.ops.object.mode_set(mode='OBJECT')
 
-        # Run full asset wiping logic via bake operator class reference
         OBJECT_OT_bake_normals.cleanup_assets(context)
 
-        # 5. RESTORE INPUT COLLECTIONS VISIBILITY
-        # root_layer_col = context.view_layer.layer_collection
-        # for sub_layer_col in root_layer_col.children:
-        #     if sub_layer_col.name in {"LP", "HP"}:
-        #         sub_layer_col.exclude = False
-
+        # Restore visibility settings for user's source target arrays
         children = context.view_layer.layer_collection.children
+        if props.lp_collection:
+            children.get(props.lp_collection.name).exclude = False
+        if props.hp_collection:
+            children.get(props.hp_collection.name).exclude = False
         
-        # Instantly restore visibility for original artist collections
-        if settings.lp_collection:
-            children.get(settings.lp_collection.name).exclude = False
-        if settings.hp_collection:
-            children.get(settings.hp_collection.name).exclude = False
-        
-        
-        self.report({'INFO'}, f"Successfully saved final map as: {filename}.png")
+        self.report({'INFO'}, f"Successfully exported combined map in {time.time() - start_time:.2f}s")
         return {'FINISHED'}
+
 
 
 
