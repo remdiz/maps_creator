@@ -17,8 +17,8 @@
 #   - Cursor change
 # ==================================================================
 
-import bpy
-import bmesh
+import bpy      # type: ignore
+import bmesh    # type: ignore
 import os
 import time
 
@@ -97,16 +97,31 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
 
         # 2. Clean up temporary material
         if clean_materials:
-            mat = bpy.data.materials.get(cls.MATERIAL_NAME)
+            # mat = bpy.data.materials.get(cls.MATERIAL_NAME)
+            mat = settings.internal_material
             if mat:
                 bpy.data.materials.remove(mat, do_unlink=True)
+            settings.internal_material = None    
 
         # 3. Clean up temporary images/textures
         if clean_textures:
-            for name in [cls.TEX_SMOOTH_NAME, cls.TEX_FLAT_NAME, cls.TEX_MASK_NAME]:
-                img = bpy.data.images.get(name)
-                if img:
-                    bpy.data.images.remove(img, do_unlink=True)
+            if settings.texture_normal_smooth:
+                bpy.data.images.remove(settings.texture_normal_smooth, do_unlink=True)
+                settings.texture_normal_smooth = None
+                
+            if settings.texture_normal_flat:
+                bpy.data.images.remove(settings.texture_normal_flat, do_unlink=True)
+                settings.texture_normal_flat = None
+                
+            if settings.texture_skew_mask:
+                bpy.data.images.remove(settings.texture_skew_mask, do_unlink=True)
+                settings.texture_skew_mask = None
+
+
+            # for name in [cls.TEX_SMOOTH_NAME, cls.TEX_FLAT_NAME, cls.TEX_MASK_NAME]:
+            #     img = bpy.data.images.get(name)
+            #     if img:
+            #         bpy.data.images.remove(img, do_unlink=True)
         
 
     
@@ -297,16 +312,22 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         # 1. Створюємо карти нормалей (Non-Color) та маску (можна sRGB, але заливаємо чорним)
         img_smooth = get_or_create_image(tex_smooth_name, res, res, is_color=False)
         img_flat = get_or_create_image(tex_flat_name, res, res, is_color=False)
-        
+
         # Маску ініціалізуємо повністю чорним кольором (щоб спочатку показувало суто Smooth normal)
         img_mask = get_or_create_image(tex_mask_name, res, res, is_color=True)
         img_mask.generated_color = (0.0, 0.0, 0.0, 1.0)
+
+        # FIXED: Assign newly created texture data-blocks back to the central scene PropertyGroup storage
+        settings.texture_normal_smooth = img_smooth
+        settings.texture_normal_flat = img_flat
+        settings.texture_skew_mask = img_mask
 
         # 2. Очищаем все старые материалы с объединенного Low-Poly объекта
         merged_lp.data.materials.clear()
         
         # 3. Создаем один единственный чистый материал для запекания
         bake_mat = bpy.data.materials.new(name="M_SmartBake_Internal")
+        settings.internal_material = bake_mat
         bake_mat.use_nodes = True
         merged_lp.data.materials.append(bake_mat)
 
@@ -625,9 +646,9 @@ class OBJECT_OT_finalize_bake(bpy.types.Operator):
         self.report({'INFO'}, "Blending textures directly in RAM...")
 
                 # 1. Retrieve the baked texture maps from the Blender database
-        img_smooth = bpy.data.images.get(OBJECT_OT_bake_normals.TEX_SMOOTH_NAME)
-        img_flat = bpy.data.images.get(OBJECT_OT_bake_normals.TEX_FLAT_NAME)
-        img_mask = bpy.data.images.get(OBJECT_OT_bake_normals.TEX_MASK_NAME)
+        img_smooth = props.texture_normal_smooth
+        img_flat = props.texture_normal_flat
+        img_mask = props.texture_skew_mask
 
         if not img_smooth or not img_flat or not img_mask:
             self.report({'ERROR'}, "Baking source textures missing from database!")
@@ -803,6 +824,28 @@ class VIEW3D_PT_maps_panel(bpy.types.Panel):
 class SmartBakerSettings(bpy.types.PropertyGroup):
     """Holds all properties for the baking tool in a single scene property container"""
 
+    # Посилання на внутрішній матеріал
+    internal_material: bpy.props.PointerProperty(
+        type=bpy.types.Material,
+        name="Internal Material"
+    )
+    
+    # Посилання на текстури
+    texture_normal_smooth: bpy.props.PointerProperty(
+        type=bpy.types.Image,
+        name="Normal Smooth Texture"
+    )
+    
+    texture_normal_flat: bpy.props.PointerProperty(
+        type=bpy.types.Image,
+        name="Normal Flat Texture"
+    )
+    
+    texture_skew_mask: bpy.props.PointerProperty(
+        type=bpy.types.Image,
+        name="Skew Mask Texture"
+    )
+    
     resolution: bpy.props.EnumProperty(
         items=texture_res_items,
         name="Resolution",
