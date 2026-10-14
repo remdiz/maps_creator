@@ -232,6 +232,29 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         bake_settings.max_ray_distance = 0.0
         
     
+    def create_texture_image(self, name, width, height, is_color=False, is_black=False):
+        """ Creates image with the given name and resolution """    
+        # If a texture with that name already exists, we delete it to avoid creating duplicates
+        if name in bpy.data.images:
+            bpy.data.images.remove(bpy.data.images[name])
+        img = bpy.data.images.new(name=name, width=width, height=height, alpha=False, float_buffer=False)
+        if not is_color:
+            img.colorspace_settings.name = 'Non-Color'
+        if is_black:
+            img.generated_color = (0.0, 0.0, 0.0, 1.0)    
+        return img
+    
+    
+    def create_texture_node(self, nodes_obj, img, label, loc):
+        """ Creates image texture node in the nodes_obj material node tree """
+        t_node = nodes_obj.new(type='ShaderNodeTexImage')
+        t_node.image = img
+        t_node.label = label
+        t_node.name = label
+        t_node.location = loc
+        return t_node
+
+    
     def execute(self, context):
         start_time = time.time()
         scene = context.scene
@@ -301,25 +324,15 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         tex_flat_name = self.TEX_FLAT_NAME # "T_Bake_Normal_Flat"
         tex_mask_name = self.TEX_MASK_NAME # "T_Bake_Skew_Mask"
 
-        # Функція-помічник для безпечного перестворення текстур (щоб не плодити дублікати)
-        def get_or_create_image(name, width, height, is_color=False):
-            # Если текстура с таким именем уже была, удаляем ее, чтобы не плодить дубликаты
-            if name in bpy.data.images:
-                bpy.data.images.remove(bpy.data.images[name])
-            img = bpy.data.images.new(name=name, width=width, height=height, alpha=False, float_buffer=False)
-            if not is_color:
-                img.colorspace_settings.name = 'Non-Color'
-            return img
-
         # 1. Створюємо карти нормалей (Non-Color) та маску (можна sRGB, але заливаємо чорним)
-        img_smooth = get_or_create_image(tex_smooth_name, res, res, is_color=False)
-        img_flat = get_or_create_image(tex_flat_name, res, res, is_color=False)
+        img_smooth = self.create_texture_image(tex_smooth_name, res, res)
+        img_flat = self.create_texture_image(tex_flat_name, res, res)
 
         # Маску ініціалізуємо повністю чорним кольором (щоб спочатку показувало суто Smooth normal)
-        img_mask = get_or_create_image(tex_mask_name, res, res, is_color=True)
-        img_mask.generated_color = (0.0, 0.0, 0.0, 1.0)
+        img_mask = self.create_texture_image(tex_mask_name, res, res, is_color=True, is_black=True)
+        # img_mask.generated_color = (0.0, 0.0, 0.0, 1.0)
 
-        # FIXED: Assign newly created texture data-blocks back to the central scene PropertyGroup storage
+        # Create normal (Non-Color) and mask (sRGB, black) maps
         settings.texture_normal_smooth = img_smooth
         settings.texture_normal_flat = img_flat
         settings.texture_skew_mask = img_mask
@@ -335,21 +348,12 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
 
         nodes = bake_mat.node_tree.nodes
 
-        def create_texture_node(nodes_obj, img, label, loc):
-            t_node = nodes_obj.new(type='ShaderNodeTexImage')
-            t_node.image = img
-            t_node.label = label
-            t_node.name = label
-            t_node.location = loc
-            return t_node
-        
-
         # Nodes links for future use
         # Normal texture nodes creation
-        self.node_smooth_ref = create_texture_node(nodes, img_smooth, "Bake Target: SMOOTH", (-600, 400))
-        self.node_flat_ref = create_texture_node(nodes, img_flat, "Bake Target: FLAT", (-600, 150))
+        self.node_smooth_ref = self.create_texture_node(nodes, img_smooth, "Bake Target: SMOOTH", (-600, 400))
+        self.node_flat_ref = self.create_texture_node(nodes, img_flat, "Bake Target: FLAT", (-600, 150))
         # Mask node creation
-        self.node_mask_ref = create_texture_node(nodes, img_mask, "Paint Mask", (-600, -100))
+        self.node_mask_ref = self.create_texture_node(nodes, img_mask, "Paint Mask", (-600, -100))
 
         self.report({'INFO'}, f"Textures {res}x{res} ready. Nodes compiled.")    
 
