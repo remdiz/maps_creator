@@ -255,6 +255,142 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         return t_node
 
     
+    def create_textures(self, context):
+        settings = context.scene.smart_bake_settings
+        lp_obj = settings.merged_lp_obj
+        # Получаем выбранное пользователем разрешение из настроек сцены
+        res = int(settings.resolution)
+        
+        # Creating textures in Blender DB
+        tex_smooth_name = self.TEX_SMOOTH_NAME # "T_Bake_Normal_Smooth"
+        tex_flat_name = self.TEX_FLAT_NAME # "T_Bake_Normal_Flat"
+        tex_mask_name = self.TEX_MASK_NAME # "T_Bake_Skew_Mask"
+
+        # 1. Створюємо карти нормалей (Non-Color) та маску (можна sRGB, але заливаємо чорним)
+        img_smooth = self.create_texture_image(tex_smooth_name, res, res)
+        img_flat = self.create_texture_image(tex_flat_name, res, res)
+
+        # Маску ініціалізуємо повністю чорним кольором (щоб спочатку показувало суто Smooth normal)
+        img_mask = self.create_texture_image(tex_mask_name, res, res, is_color=True, is_black=True)
+        # img_mask.generated_color = (0.0, 0.0, 0.0, 1.0)
+
+        # Create normal (Non-Color) and mask (sRGB, black) maps
+        settings.texture_normal_smooth = img_smooth
+        settings.texture_normal_flat = img_flat
+        settings.texture_skew_mask = img_mask
+
+        # 2. Очищаем все старые материалы с объединенного Low-Poly объекта
+        lp_obj.data.materials.clear()
+        
+        # 3. Создаем один единственный чистый материал для запекания
+        bake_mat = bpy.data.materials.new(name="M_SmartBake_Internal")
+        settings.internal_material = bake_mat
+        bake_mat.use_nodes = True
+        lp_obj.data.materials.append(bake_mat)
+
+        nodes = bake_mat.node_tree.nodes
+
+        # Nodes links for future use
+        # Normal texture nodes creation
+        self.node_smooth_ref = self.create_texture_node(nodes, img_smooth, "Bake Target: SMOOTH", (-600, 400))
+        self.node_flat_ref = self.create_texture_node(nodes, img_flat, "Bake Target: FLAT", (-600, 150))
+        # Mask node creation
+        self.node_mask_ref = self.create_texture_node(nodes, img_mask, "Paint Mask", (-600, -100))
+        self.report({'INFO'}, f"Textures {res}x{res} ready. Nodes compiled.")
+        return bake_mat
+        
+    
+    def bake_normal_map(self, context, smoothness, texture_node):
+        settings = context.scene.smart_bake_settings
+        bake_mat = settings.internal_material
+        merged_lp = settings.merged_lp_obj
+        merged_hp = settings.merged_hp_obj
+        for poly in merged_lp.data.polygons:
+            poly.use_smooth = smoothness
+            merged_lp.data.update() # Flush data changes to database
+    
+            
+            # Робимо активною ноду Smooth текстури
+            bake_mat.node_tree.nodes.active = texture_node
+            texture_node.select = True
+            
+            # Execute bake inside a safe context override wrapper
+            # TODO: if bake fails, scene becomes corrupted -> restore previous state
+            with context.temp_override(active_object=merged_lp, selected_objects=[merged_hp, merged_lp]):
+                bpy.ops.object.bake(type='NORMAL')
+
+    
+    def create_mix_shader(self, context):
+        settings = context.scene.smart_bake_settings
+        bake_mat = settings.internal_material
+        nodes = bake_mat.node_tree.nodes
+        # 1. Mix node
+        node_mix = nodes.new(type='ShaderNodeMix')
+        node_mix.data_type = 'RGBA' 
+        node_mix.blend_type = 'MIX'
+        node_mix.location = (-200, 250)
+
+        # 2. Normal Map node
+        node_normal_map = nodes.new(type='ShaderNodeNormalMap')
+        node_normal_map.location = (50, 250)
+
+        # 3. Looking for Principled BSDF
+        principled_node = None
+        for n in nodes:
+            if n.type == 'BSDF_PRINCIPLED':
+                principled_node = n
+                break
+        
+        # If Principled BSDF is absent, lets simply use Material Output
+        if not principled_node:
+            for n in nodes:
+                if n.type == 'OUTPUT_MATERIAL':
+                    bake_mat.node_tree.links.new(node_mix.outputs['Result'], n.inputs['Surface'])
+                    break
+        
+        # 4. Linking nodes
+        links = bake_mat.node_tree.links
+        
+        # Smooth Normal -> slot A
+        links.new(self.node_smooth_ref.outputs['Color'], node_mix.inputs['A'])
+        
+        # Flat Normal -> slot B
+        links.new(self.node_flat_ref.outputs['Color'], node_mix.inputs['B'])
+        
+        # Connecting mask to Mix node Factor slot
+        links.new(self.node_mask_ref.outputs['Color'], node_mix.inputs['Factor'])
+        
+        # If we have Principled BSDF, using Normal Map through Normal slot
+        if principled_node:
+            links.new(node_mix.outputs['Result'], node_normal_map.inputs['Color'])
+            links.new(node_normal_map.outputs['Normal'], principled_node.inputs['Normal'])
+        
+    
+    
+    def postprocess(self, context):
+        settings = context.scene.smart_bake_settings
+        bake_mat = settings.internal_material
+        nodes = bake_mat.node_tree.nodes
+        # Activate mask node for future texture painting
+        nodes.active = self.node_mask_ref
+        self.node_mask_ref.select = True
+
+        # Enable Material Preview in the viewport
+        for area in context.screen.areas:
+            if area.type == 'VIEW_3D':
+                for space in area.spaces:
+                    if space.type == 'VIEW_3D':
+                        space.shading.type = 'MATERIAL'
+
+        children = context.view_layer.layer_collection.children
+                
+        # Instantly access and exclude layer collections via their names from pointers
+        if settings.lp_collection:
+            children.get(settings.lp_collection.name).exclude = True
+        if settings.hp_collection:
+            children.get(settings.hp_collection.name).exclude = True
+    
+    
     def execute(self, context):
         start_time = time.time()
         scene = context.scene
@@ -316,46 +452,48 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         # === STEP 3.5: AUTOMATIC TEXTURES AND MATERIAL CREATION ===
         self.report({'INFO'}, "Texture generation...")
 
-        # Получаем выбранное пользователем разрешение из настроек сцены
-        res = int(settings.resolution)
+        # # Получаем выбранное пользователем разрешение из настроек сцены
+        # res = int(settings.resolution)
         
-        # Creating textures in Blender DB
-        tex_smooth_name = self.TEX_SMOOTH_NAME # "T_Bake_Normal_Smooth"
-        tex_flat_name = self.TEX_FLAT_NAME # "T_Bake_Normal_Flat"
-        tex_mask_name = self.TEX_MASK_NAME # "T_Bake_Skew_Mask"
+        # # Creating textures in Blender DB
+        # tex_smooth_name = self.TEX_SMOOTH_NAME # "T_Bake_Normal_Smooth"
+        # tex_flat_name = self.TEX_FLAT_NAME # "T_Bake_Normal_Flat"
+        # tex_mask_name = self.TEX_MASK_NAME # "T_Bake_Skew_Mask"
 
-        # 1. Створюємо карти нормалей (Non-Color) та маску (можна sRGB, але заливаємо чорним)
-        img_smooth = self.create_texture_image(tex_smooth_name, res, res)
-        img_flat = self.create_texture_image(tex_flat_name, res, res)
+        # # 1. Створюємо карти нормалей (Non-Color) та маску (можна sRGB, але заливаємо чорним)
+        # img_smooth = self.create_texture_image(tex_smooth_name, res, res)
+        # img_flat = self.create_texture_image(tex_flat_name, res, res)
 
-        # Маску ініціалізуємо повністю чорним кольором (щоб спочатку показувало суто Smooth normal)
-        img_mask = self.create_texture_image(tex_mask_name, res, res, is_color=True, is_black=True)
-        # img_mask.generated_color = (0.0, 0.0, 0.0, 1.0)
+        # # Маску ініціалізуємо повністю чорним кольором (щоб спочатку показувало суто Smooth normal)
+        # img_mask = self.create_texture_image(tex_mask_name, res, res, is_color=True, is_black=True)
+        # # img_mask.generated_color = (0.0, 0.0, 0.0, 1.0)
 
-        # Create normal (Non-Color) and mask (sRGB, black) maps
-        settings.texture_normal_smooth = img_smooth
-        settings.texture_normal_flat = img_flat
-        settings.texture_skew_mask = img_mask
+        # # Create normal (Non-Color) and mask (sRGB, black) maps
+        # settings.texture_normal_smooth = img_smooth
+        # settings.texture_normal_flat = img_flat
+        # settings.texture_skew_mask = img_mask
 
-        # 2. Очищаем все старые материалы с объединенного Low-Poly объекта
-        merged_lp.data.materials.clear()
+        # # 2. Очищаем все старые материалы с объединенного Low-Poly объекта
+        # merged_lp.data.materials.clear()
         
-        # 3. Создаем один единственный чистый материал для запекания
-        bake_mat = bpy.data.materials.new(name="M_SmartBake_Internal")
-        settings.internal_material = bake_mat
-        bake_mat.use_nodes = True
-        merged_lp.data.materials.append(bake_mat)
+        # # 3. Создаем один единственный чистый материал для запекания
+        # bake_mat = bpy.data.materials.new(name="M_SmartBake_Internal")
+        # settings.internal_material = bake_mat
+        # bake_mat.use_nodes = True
+        # merged_lp.data.materials.append(bake_mat)
 
+        # nodes = bake_mat.node_tree.nodes
+
+        # # Nodes links for future use
+        # # Normal texture nodes creation
+        # self.node_smooth_ref = self.create_texture_node(nodes, img_smooth, "Bake Target: SMOOTH", (-600, 400))
+        # self.node_flat_ref = self.create_texture_node(nodes, img_flat, "Bake Target: FLAT", (-600, 150))
+        # # Mask node creation
+        # self.node_mask_ref = self.create_texture_node(nodes, img_mask, "Paint Mask", (-600, -100))
+
+        # self.report({'INFO'}, f"Textures {res}x{res} ready. Nodes compiled.")
+        bake_mat = self.create_textures(context)
         nodes = bake_mat.node_tree.nodes
-
-        # Nodes links for future use
-        # Normal texture nodes creation
-        self.node_smooth_ref = self.create_texture_node(nodes, img_smooth, "Bake Target: SMOOTH", (-600, 400))
-        self.node_flat_ref = self.create_texture_node(nodes, img_flat, "Bake Target: FLAT", (-600, 150))
-        # Mask node creation
-        self.node_mask_ref = self.create_texture_node(nodes, img_mask, "Paint Mask", (-600, -100))
-
-        self.report({'INFO'}, f"Textures {res}x{res} ready. Nodes compiled.")    
 
         # === STEP 4: CYCLES CONFIGURATION ===
         self.report({'INFO'}, "Geometry ready. Preparing Cycles...")
@@ -369,19 +507,20 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         
         # bpy.ops.object.shade_smooth()
         # Low-level Python loop to force Smooth shading directly in memory
-        for poly in merged_lp.data.polygons:
-            poly.use_smooth = True
-        merged_lp.data.update() # Flush data changes to database
+        # for poly in merged_lp.data.polygons:
+        #     poly.use_smooth = True
+        # merged_lp.data.update() # Flush data changes to database
 
         
-        # Робимо активною ноду Smooth текстури
-        bake_mat.node_tree.nodes.active = self.node_smooth_ref
-        self.node_smooth_ref.select = True
+        # # Робимо активною ноду Smooth текстури
+        # bake_mat.node_tree.nodes.active = self.node_smooth_ref
+        # self.node_smooth_ref.select = True
         
-        # Execute bake inside a safe context override wrapper
-        # TODO: if bake fails, scene becomes corrupted -> restore previous state
-        with context.temp_override(active_object=merged_lp, selected_objects=[merged_hp, merged_lp]):
-            bpy.ops.object.bake(type='NORMAL')
+        # # Execute bake inside a safe context override wrapper
+        # # TODO: if bake fails, scene becomes corrupted -> restore previous state
+        # with context.temp_override(active_object=merged_lp, selected_objects=[merged_hp, merged_lp]):
+        #     bpy.ops.object.bake(type='NORMAL')
+        self.bake_normal_map(context, smoothness=True, texture_node=self.node_smooth_ref)
         
         
         # --- PASS 2: FLAT NORMAL (for normal correction) ---
@@ -390,17 +529,18 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         # Temporarily switch merged Low-Poly to Flat Shading
         # bpy.ops.object.shade_flat()
         # Low-level Python loop to force Flat shading directly in memory
-        for poly in merged_lp.data.polygons:
-            poly.use_smooth = False
-        merged_lp.data.update()
+        # for poly in merged_lp.data.polygons:
+        #     poly.use_smooth = False
+        # merged_lp.data.update()
         
-        # Activate Flat texture node
-        bake_mat.node_tree.nodes.active = self.node_flat_ref
-        self.node_flat_ref.select = True
+        # # Activate Flat texture node
+        # bake_mat.node_tree.nodes.active = self.node_flat_ref
+        # self.node_flat_ref.select = True
         
-        # Execute second bake pass safely
-        with context.temp_override(active_object=merged_lp, selected_objects=[merged_hp, merged_lp]):
-            bpy.ops.object.bake(type='NORMAL')
+        # # Execute second bake pass safely
+        # with context.temp_override(active_object=merged_lp, selected_objects=[merged_hp, merged_lp]):
+        #     bpy.ops.object.bake(type='NORMAL')
+        self.bake_normal_map(context, smoothness=False, texture_node=self.node_flat_ref)
         
         
         # Reset shading state back to smooth
@@ -422,59 +562,60 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         # === STEP 6: MIX SHADER COMPILATION ===
         self.report({'INFO'}, "Final shader creation...")
         
-        # 1. Mix node
-        node_mix = nodes.new(type='ShaderNodeMix')
-        node_mix.data_type = 'RGBA' 
-        node_mix.blend_type = 'MIX'
-        node_mix.location = (-200, 250)
+        # # 1. Mix node
+        # node_mix = nodes.new(type='ShaderNodeMix')
+        # node_mix.data_type = 'RGBA' 
+        # node_mix.blend_type = 'MIX'
+        # node_mix.location = (-200, 250)
 
-        # 2. Normal Map node
-        node_normal_map = nodes.new(type='ShaderNodeNormalMap')
-        node_normal_map.location = (50, 250)
+        # # 2. Normal Map node
+        # node_normal_map = nodes.new(type='ShaderNodeNormalMap')
+        # node_normal_map.location = (50, 250)
 
-        # 3. Looking for Principled BSDF
-        principled_node = None
-        for n in nodes:
-            if n.type == 'BSDF_PRINCIPLED':
-                principled_node = n
-                break
+        # # 3. Looking for Principled BSDF
+        # principled_node = None
+        # for n in nodes:
+        #     if n.type == 'BSDF_PRINCIPLED':
+        #         principled_node = n
+        #         break
         
-        # If Principled BSDF is absent, lets simply use Material Output
-        if not principled_node:
-            for n in nodes:
-                if n.type == 'OUTPUT_MATERIAL':
-                    bake_mat.node_tree.links.new(node_mix.outputs['Result'], n.inputs['Surface'])
-                    break
+        # # If Principled BSDF is absent, lets simply use Material Output
+        # if not principled_node:
+        #     for n in nodes:
+        #         if n.type == 'OUTPUT_MATERIAL':
+        #             bake_mat.node_tree.links.new(node_mix.outputs['Result'], n.inputs['Surface'])
+        #             break
         
-        # 4. Linking nodes
-        links = bake_mat.node_tree.links
+        # # 4. Linking nodes
+        # links = bake_mat.node_tree.links
         
-        # Smooth Normal -> slot A
-        links.new(self.node_smooth_ref.outputs['Color'], node_mix.inputs['A'])
+        # # Smooth Normal -> slot A
+        # links.new(self.node_smooth_ref.outputs['Color'], node_mix.inputs['A'])
         
-        # Flat Normal -> slot B
-        links.new(self.node_flat_ref.outputs['Color'], node_mix.inputs['B'])
+        # # Flat Normal -> slot B
+        # links.new(self.node_flat_ref.outputs['Color'], node_mix.inputs['B'])
         
-        # Connecting mask to Mix node Factor slot
-        links.new(self.node_mask_ref.outputs['Color'], node_mix.inputs['Factor'])
+        # # Connecting mask to Mix node Factor slot
+        # links.new(self.node_mask_ref.outputs['Color'], node_mix.inputs['Factor'])
         
-        # If we have Principled BSDF, using Normal Map through Normal slot
-        if principled_node:
-            links.new(node_mix.outputs['Result'], node_normal_map.inputs['Color'])
-            links.new(node_normal_map.outputs['Normal'], principled_node.inputs['Normal'])
+        # # If we have Principled BSDF, using Normal Map through Normal slot
+        # if principled_node:
+        #     links.new(node_mix.outputs['Result'], node_normal_map.inputs['Color'])
+        #     links.new(node_normal_map.outputs['Normal'], principled_node.inputs['Normal'])
+        self.create_mix_shader(context)
 
         # === STEP 7: POST-BAKE VIEWPORT SETUP ===
         
         # Activate mask node for future texture painting
-        nodes.active = self.node_mask_ref
-        self.node_mask_ref.select = True
+        # nodes.active = self.node_mask_ref
+        # self.node_mask_ref.select = True
 
-        # Enable Material Preview in the viewport
-        for area in context.screen.areas:
-            if area.type == 'VIEW_3D':
-                for space in area.spaces:
-                    if space.type == 'VIEW_3D':
-                        space.shading.type = 'MATERIAL'
+        # # Enable Material Preview in the viewport
+        # for area in context.screen.areas:
+        #     if area.type == 'VIEW_3D':
+        #         for space in area.spaces:
+        #             if space.type == 'VIEW_3D':
+        #                 space.shading.type = 'MATERIAL'
 
         # === STEP 7.5: DISABLE INPUT COLLECTIONS VISIBILITY ===
         self.report({'INFO'}, "Hiding input LP and HP collections...")
@@ -488,13 +629,14 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         #     if sub_layer_col.name in {"LP", "HP"}:
         #         sub_layer_col.exclude = True   
 
-        children = context.view_layer.layer_collection.children
+        # children = context.view_layer.layer_collection.children
         
-        # Instantly access and exclude layer collections via their names from pointers
-        if settings.lp_collection:
-            children.get(settings.lp_collection.name).exclude = True
-        if settings.hp_collection:
-            children.get(settings.hp_collection.name).exclude = True
+        # # Instantly access and exclude layer collections via their names from pointers
+        # if settings.lp_collection:
+        #     children.get(settings.lp_collection.name).exclude = True
+        # if settings.hp_collection:
+        #     children.get(settings.hp_collection.name).exclude = True
+        self.postprocess(context)
 
         self.report({'INFO'}, "Baking finished!")
         return {'FINISHED'}
