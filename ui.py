@@ -23,6 +23,12 @@ class VIEW3D_PT_maps_panel(bpy.types.Panel):
         
         # FIXED: Draw interactive collection selectors with pipettes instead of old assignment buttons
         box_slots.prop(scene.smart_bake_settings, "lp_collection", text="Low-Poly Collection", icon='MESH_ICOSPHERE')
+        show_extrusion = box_slots.row()
+        lp_collection = scene.smart_bake_settings.lp_collection
+        show_extrusion.enabled = bool(
+            lp_collection and any(obj.type == 'MESH' for obj in lp_collection.objects)
+        )
+        show_extrusion.prop(scene.smart_bake_settings, "show_extrusion", text="Show Extrusion")
         box_slots.prop(scene.smart_bake_settings, "hp_collection", text="High-Poly Collection", icon='MESH_MONKEY')
         
 

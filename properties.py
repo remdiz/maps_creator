@@ -1,5 +1,41 @@
 import bpy      # type: ignore
 
+
+def _update_extrusion_preview(settings, context):
+    from .operators import OBJECT_OT_bake_normals
+
+    # if not settings.show_extrusion:
+    #     preview = settings.extrusion_preview_obj
+    #     if preview:
+    #         OBJECT_OT_bake_normals.delete_object(preview)
+    #         settings.extrusion_preview_obj = None
+    #     return
+
+    # collection = settings.lp_collection
+    # if not collection or not any(obj.type == 'MESH' for obj in collection.objects):
+    #     settings.show_extrusion = False
+    #     return
+
+    # preview = OBJECT_OT_bake_normals._prepare_and_merge_collection(
+    #     context,
+    #     collection,
+    #     OBJECT_OT_bake_normals.EXTRUSION_PREVIEW_NAME
+    # )
+    # preview.display_type = 'WIRE'
+    # preview.hide_render = True
+
+    # old_preview = settings.extrusion_preview_obj
+    # settings.extrusion_preview_obj = preview
+    # if old_preview:
+    #     OBJECT_OT_bake_normals.delete_object(old_preview)
+    OBJECT_OT_bake_normals.update_extrusion(context, settings)
+
+
+def _update_lp_collection(settings, context):
+    if settings.show_extrusion:
+        _update_extrusion_preview(settings, context)
+
+
 texture_res_items = [
     ('1024', "1K (1024x1024)", "Bake resolution 1024x1024"),
     ('2048', "2K (2048x2048)", "Bake resolution 2048x2048"),
@@ -59,7 +95,18 @@ class SmartBakerSettings(bpy.types.PropertyGroup):
     lp_collection: bpy.props.PointerProperty(
         type=bpy.types.Collection,
         name="Low-Poly",
-        description="Select the collection containing Low-Poly objects"
+        description="Select the collection containing Low-Poly objects",
+        update=_update_lp_collection
+    )
+    show_extrusion: bpy.props.BoolProperty(
+        name="Show Extrusion",
+        description="Show a wireframe preview merged from the Low-Poly collection",
+        default=False,
+        update=_update_extrusion_preview
+    )
+    extrusion_preview_obj: bpy.props.PointerProperty(
+        type=bpy.types.Object,
+        name="Extrusion Preview Object"
     )
     hp_collection: bpy.props.PointerProperty(
         type=bpy.types.Collection,

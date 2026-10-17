@@ -14,6 +14,7 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
     # =======================================================================
     MERGED_LP_NAME = "_Bake_Merged_LowPoly"
     MERGED_HP_NAME = "_Bake_Merged_HighPoly"
+    EXTRUSION_PREVIEW_NAME = "_Extrusion_Preview_LowPoly"
     MATERIAL_NAME = "M_SmartBake_Internal"
     TEX_SMOOTH_NAME = "T_Bake_Normal_Smooth"
     TEX_FLAT_NAME = "T_Bake_Normal_Flat"
@@ -123,6 +124,34 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         return True
 
 
+    @classmethod
+    def update_extrusion(cls, context, settings):
+        if not settings.show_extrusion:
+            preview = settings.extrusion_preview_obj
+            if preview:
+                cls.delete_object(preview)
+                settings.extrusion_preview_obj = None
+            return
+        
+        collection = settings.lp_collection
+        if not collection or not any(obj.type == 'MESH' for obj in collection.objects):
+            settings.show_extrusion = False
+            return
+    
+        preview = cls._prepare_and_merge_collection(
+            context,
+            collection,
+            cls.EXTRUSION_PREVIEW_NAME
+        )
+        preview.display_type = 'WIRE'
+        preview.hide_render = True
+    
+        old_preview = settings.extrusion_preview_obj
+        settings.extrusion_preview_obj = preview
+        if old_preview:
+            cls.delete_object(old_preview)
+    
+    
     @classmethod
     def _prepare_and_merge_collection(cls, context, collection, target_merged_name):
         """Duplicates mesh objects from a collection, applies modifiers, and merges them into one"""
