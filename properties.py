@@ -31,6 +31,39 @@ def _update_extrusion_preview(settings, context):
     OBJECT_OT_bake_normals.update_extrusion(context, settings)
 
 
+def _update_extrusion_value(settings, context):
+    if not settings.show_extrusion:
+        return
+
+    from .operators import OBJECT_OT_bake_normals
+    OBJECT_OT_bake_normals.change_extrusion(settings, context)
+
+    # preview = settings.extrusion_preview_obj
+    # if not preview:
+    #     preview = bpy.data.objects.get(OBJECT_OT_bake_normals.EXTRUSION_PREVIEW_NAME)
+    #     if preview:
+    #         settings.extrusion_preview_obj = preview
+
+    # if not preview:
+    #     OBJECT_OT_bake_normals.update_extrusion(context, settings)
+    #     return
+
+    # displace = next(
+    #     (
+    #         modifier
+    #         for modifier in preview.modifiers
+    #         if modifier.type == 'DISPLACE' and modifier.name.startswith("Extrusion")
+    #     ),
+    #     None,
+    # )
+    # if not displace:
+    #     displace = preview.modifiers.new(name="Extrusion", type='DISPLACE')
+    #     displace.direction = 'NORMAL'
+    #     displace.mid_level = 0.0
+
+    # displace.strength = settings.extrusion
+
+
 def _update_lp_collection(settings, context):
     if settings.show_extrusion:
         _update_extrusion_preview(settings, context)
@@ -79,8 +112,9 @@ class SmartBakerSettings(bpy.types.PropertyGroup):
         description="Ray Height for selected to active baking",
         default=0.05,  
         min=0.0,
-        max=10.0,
-        subtype='DISTANCE'
+        max=20.0,
+        subtype='DISTANCE',
+        update=_update_extrusion_value
     )
     filename: bpy.props.StringProperty(
         name="File Name",

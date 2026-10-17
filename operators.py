@@ -24,16 +24,24 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
     @classmethod
     def delete_object(cls, target):
         """Completely remove target mesh object (assumes target exist)"""
-        # if target.name in bpy.data.objects:
-            # Unlink from all collections first
-            # for col in list(target.users_collection):
-            #     col.objects.unlink(target)
-            # Remove object and mesh data blocks from memory
         if target and target.name in bpy.data.objects:
             target_mesh_data = target.data
+            # preview_textures = [
+            #     modifier.texture
+            #     for modifier in target.modifiers
+            #     if modifier.type == 'DISPLACE'
+            #     and modifier.texture
+            #     and modifier.texture.get("smart_baker_extrusion_preview")
+            # ]
             bpy.data.objects.remove(target, do_unlink=True)
             if target_mesh_data and target_mesh_data.users == 0:
-                    bpy.data.meshes.remove(target_mesh_data, do_unlink=True)
+                bpy.data.meshes.remove(target_mesh_data, do_unlink=True)
+            # for texture in preview_textures:
+            #     image = texture.image
+            #     if texture.users == 0:
+            #         bpy.data.textures.remove(texture, do_unlink=True)
+            #     if image and image.get("smart_baker_extrusion_preview") and image.users == 0:
+            #         bpy.data.images.remove(image, do_unlink=True)
     
     @classmethod
     def cleanup_assets(cls, context, clean_geometry=True, clean_materials=True, clean_textures=True):
@@ -125,6 +133,34 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
 
 
     @classmethod
+    def change_extrusion(cls, settings, context):
+        preview = settings.extrusion_preview_obj
+        if not preview:
+            preview = bpy.data.objects.get(OBJECT_OT_bake_normals.EXTRUSION_PREVIEW_NAME)
+            if preview:
+                settings.extrusion_preview_obj = preview
+    
+        if not preview:
+            OBJECT_OT_bake_normals.update_extrusion(context, settings)
+            return
+    
+        displace = next(
+            (
+                modifier
+                for modifier in preview.modifiers
+                if modifier.type == 'DISPLACE' and modifier.name.startswith("Extrusion")
+            ),
+            None,
+        )
+        if not displace:
+            displace = preview.modifiers.new(name="Extrusion", type='DISPLACE')
+            displace.direction = 'NORMAL'
+            displace.mid_level = 0.0
+    
+        displace.strength = settings.extrusion
+    
+    
+    @classmethod
     def update_extrusion(cls, context, settings):
         if not settings.show_extrusion:
             preview = settings.extrusion_preview_obj
@@ -137,15 +173,33 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         if not collection or not any(obj.type == 'MESH' for obj in collection.objects):
             settings.show_extrusion = False
             return
-    
+
         preview = cls._prepare_and_merge_collection(
             context,
             collection,
             cls.EXTRUSION_PREVIEW_NAME
         )
+        displace = preview.modifiers.new(name="Extrusion", type='DISPLACE')
+        # texture_image = bpy.data.images.new(
+        #     name="T_Extrusion_Preview",
+        #     width=1,
+        #     height=1,
+        #     alpha=True,
+        # )
+        # texture_image.generated_color = (1.0, 1.0, 1.0, 1.0)
+        # texture_image["smart_baker_extrusion_preview"] = True
+        # texture = bpy.data.textures.new(name="T_Extrusion_Preview", type='IMAGE')
+        # texture.image = texture_image
+        # texture["smart_baker_extrusion_preview"] = True
+        # displace.texture = texture
+        # displace.texture_coords = 'LOCAL'
+        displace.direction = 'NORMAL'
+        displace.mid_level = 0.0
+        displace.strength = settings.extrusion
+
         preview.display_type = 'WIRE'
         preview.hide_render = True
-    
+
         old_preview = settings.extrusion_preview_obj
         settings.extrusion_preview_obj = preview
         if old_preview:
@@ -168,7 +222,7 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         # Duplicate and apply modifiers via bmesh
         if collection:
             for obj in collection.objects:
-                if obj.type == 'MESH':
+                if obj.type == 'MESH' and not obj.hide_get():
                     # Duplicate object w/o using operators
                     object_eval = obj.evaluated_get(depsgraph)
                     mesh_from_eval = bpy.data.meshes.new_from_object(object_eval)
@@ -585,6 +639,12 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
 
         self.delete_object(merged_hp)
         settings.merged_hp_obj = None
+
+        preview = settings.extrusion_preview_obj
+        if preview:
+            self.delete_object(preview)
+            settings.extrusion_preview_obj = None
+        settings.show_extrusion = False    
 
         self.report({'INFO'}, "Batch baking finished! Both textures ready.")
 
