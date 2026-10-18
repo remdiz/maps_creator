@@ -1,5 +1,9 @@
-import bpy      # type: ignore
-import bmesh    # type: ignore
+import bpy                                  # type: ignore
+import bmesh                                # type: ignore
+import numpy as np
+from mathutils import Vector                # type: ignore
+from mathutils.bvhtree import BVHTree       # type: ignore
+
 import os
 import time
 
@@ -607,11 +611,11 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         #     bpy.ops.object.bake(type='NORMAL')
         start_time = time.time()
         
-        self.bake_normal_map(context, smoothness=True, texture_node=self.node_smooth_ref)
+        # self.bake_normal_map(context, smoothness=True, texture_node=self.node_smooth_ref)
         
         
         # --- PASS 2: FLAT NORMAL (for normal correction) ---
-        self.report({'INFO'}, "Pass 2 Start: Flat Normal Baking...")
+        # self.report({'INFO'}, "Pass 2 Start: Flat Normal Baking...")
         
         # Temporarily switch merged Low-Poly to Flat Shading
         # bpy.ops.object.shade_flat()
@@ -627,8 +631,10 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         # # Execute second bake pass safely
         # with context.temp_override(active_object=merged_lp, selected_objects=[merged_hp, merged_lp]):
         #     bpy.ops.object.bake(type='NORMAL')
-        self.bake_normal_map(context, smoothness=False, texture_node=self.node_flat_ref)
+        # self.bake_normal_map(context, smoothness=False, texture_node=self.node_flat_ref)
         
+        buf_smooth, buf_flat = self.bake_normal_bvhtree(context, settings)
+        self.finalize_and_flush_buffers(settings, buf_smooth, buf_flat)
         
         # Reset shading state back to smooth
         # bpy.ops.object.shade_smooth()
@@ -733,6 +739,280 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
 
         self.report({'INFO'}, "Baking finished!")
         return {'FINISHED'}
+
+
+    def finalize_and_flush_buffers(self, settings, buffer_smooth, buffer_flat):
+        """
+        Приймає 2D NumPy масиви нормалей, обробляє координатні простори (DirectX/OpenGL),
+        i вимиває дані в RAM-структури Blender через foreach_set().
+        """
+        width = int(settings.resolution)
+        height = int(settings.resolution)
+        is_directx = settings.directx
+        # 1. Обробка прапорця координатного простору (DirectX Y-Flip)
+        # У DirectX зелений канал (Y) інвертований. На чистій математиці NumPy це робиться миттєво.
+        if is_directx:
+            # buffer[:, :, 1] відповідає за зелений канал (G) у форматі RGBA
+            buffer_smooth[:, :, 1] = 1.0 - buffer_smooth[:, :, 1]
+            buffer_flat[:, :, 1] = 1.0 - buffer_flat[:, :, 1]
+
+        # 2. Випрямлення масивів (Flattening) для C-буфера Blender
+        # Blender очікує одновимірний масив float32 довжиною width * height * 4
+        flat_smooth = buffer_smooth.ravel().astype(np.float32)
+        flat_flat = buffer_flat.ravel().astype(np.float32)
+
+        # 3. Підготовка та запис текстури Smooth Pass
+        tex_smooth = settings.texture_normal_smooth
+        if tex_smooth:
+            # Гарантуємо правильний розмір текстурного блоку
+            if tex_smooth.size[0] != width or tex_smooth.size[1] != height:
+                tex_smooth.scale(width, height)
+                
+            # Важливо: вимикаємо будь-яке колірне керування (для нормалей потрібні чисті дані)
+            tex_smooth.colorspace_settings.name = 'Non-Color'
+            
+            # Миттєвий запис у C-Buffer
+            tex_smooth.pixels.foreach_set(flat_smooth)
+            tex_smooth.update() # Оновлюємо текстуру у в'юпорті
+
+        # 4. Підготовка та запис текстури Flat Pass
+        tex_flat = settings.texture_normal_flat
+        if tex_flat:
+            if tex_flat.size[0] != width or tex_flat.size[1] != height:
+                tex_flat.scale(width, height)
+                
+            tex_flat.colorspace_settings.name = 'Non-Color'
+            
+            tex_flat.pixels.foreach_set(flat_flat)
+            tex_flat.update()
+
+        # 5. Ініціалізація порожньої Paint маски (T_Bake_Skew_Mask)
+        # Створюємо чистий чорний колірний простір для ручного малювання
+        tex_mask = settings.texture_skew_mask
+        if tex_mask:
+            if tex_mask.size[0] != width or tex_mask.size[1] != height:
+                tex_mask.scale(width, height)
+                
+            tex_mask.colorspace_settings.name = 'Non-Color'
+            
+            # Ініціалізуємо маску чорним кольором (0.0, 0.0, 0.0, 1.0)
+            mask_data = np.array([0.0, 0.0, 0.0, 1.0] * (width * height), dtype=np.float32)
+            tex_mask.pixels.foreach_set(mask_data)
+            tex_mask.update()
+    
+    
+    def bake_normal_bvhtree(self, context, settings):
+        """Bakes normal map using BVH tree raycasting for high-poly to low-poly transfer"""
+        width = int(settings.resolution)
+        height = int(settings.resolution)
+        # TODO: this is wrong! we should use mesh extrusion from the Displace modifier, not the user input
+        ray_max_dist = settings.extrusion
+        is_directx = settings.directx
+        
+        depsgraph = context.evaluated_depsgraph_get()
+        lp_obj = settings.merged_lp_obj.evaluated_get(depsgraph)
+        hp_obj = settings.merged_hp_obj
+        
+        lp_mesh = bpy.data.meshes.new_from_object(lp_obj)
+        # hp_mesh = hp_obj.to_mesh()
+        bm = bmesh.new()
+        bm.from_mesh(lp_mesh)
+        bmesh.ops.triangulate(bm, faces=bm.faces[:])
+        bm.to_mesh(lp_mesh)
+        bm.free() # Звільняємо пам'ять bmesh
+
+        lp_mesh.calc_tangents()
+        
+        # Створення BVH-дерева High-Poly
+        hp_bvh = BVHTree.FromObject(hp_obj, depsgraph, epsilon=0.0001)
+        
+        # Трансформаційні матриці
+        lp_world_mat = np.array(lp_obj.matrix_world)
+        hp_world_inv = np.array(hp_obj.matrix_world.inverted())
+        hp_world_mat = np.array(hp_obj.matrix_world)
+        
+        # Матриця нормалей LP (Inverse Transpose 3x3)
+        lp_norm_mat = np.linalg.inv(lp_world_mat[:3, :3]).T
+
+        # 1. СТВОРЕННЯ СІТКИ ПІКСЕЛІВ (Pixel Grid)
+        # Створюємо масив координат центрів усіх пікселів у UV-просторі
+        u = np.linspace(0.5 / width, 1.0 - 0.5 / width, width)
+        v = np.linspace(0.5 / height, 1.0 - 0.5 / height, height)
+        uu, vv = np.meshgrid(u, v)
+        pixel_uvs = np.stack([uu, vv], axis=-1).reshape(-1, 2) # Форма: (N_pixels, 2)
+
+        # Вихідні буфери текстур
+        buffer_smooth = np.array([0.5, 0.5, 1.0, 1.0] * (width * height), dtype=np.float32).reshape(-1, 4)
+        buffer_flat = np.array([0.5, 0.5, 1.0, 1.0] * (width * height), dtype=np.float32).reshape(-1, 4)
+
+        # 2. ЕКСТРАКЦІЯ ДАНИХ ГЕОМЕТРІЇ
+        uv_layer = lp_mesh.uv_layers.active.data
+        
+        # Швидке витягування масивів через foreach_get
+        num_loops = len(lp_mesh.loops)
+        loop_uvs = np.zeros(num_loops * 2, dtype=np.float32)
+        uv_layer.foreach_get("uv", loop_uvs)
+        loop_uvs = loop_uvs.reshape(-1, 2)
+        
+        # Переводимо полігони в індекси циклів (масив трикутників)
+        tri_loop_indices = np.array([poly.loop_indices for poly in lp_mesh.polygons], dtype=np.int32)
+        
+        # Отримуємо UV-координати для кожної вершини кожного трикутника
+        # Форма: (N_triangles, 3, 2)
+        tri_uvs = loop_uvs[tri_loop_indices]
+
+        # Витягуємо 3D позиції вершин, нормалей, тангенсів
+        num_verts = len(lp_mesh.vertices)
+        vert_cos = np.zeros(num_verts * 3, dtype=np.float32)
+        lp_mesh.vertices.foreach_get("co", vert_cos)
+        vert_cos = vert_cos.reshape(-1, 3)
+
+        # Для швидкості ітеруємо лише трикутники, але обчислення всередині них — векторні
+        for tri_idx, poly in enumerate(lp_mesh.polygons):
+            # Обмежувальний прямокутник трикутника в пікселях
+            t_uv = tri_uvs[tri_idx]
+            p_min = np.floor(np.min(t_uv, axis=0) * [width, height]).astype(int)
+            p_max = np.ceil(np.max(t_uv, axis=0) * [width, height]).astype(int)
+            
+            x_min, y_min = max(0, p_min[0]), max(0, p_min[1])
+            x_max, y_max = min(width - 1, p_max[0]), min(height - 1, p_max[1])
+            
+            if x_max < x_min or y_max < y_min:
+                continue
+                
+            # Вирізаємо маску пікселів, що потрапляють у Bounding Box трикутника
+            x_range = np.arange(x_min, x_max + 1)
+            y_range = np.arange(y_min, y_max + 1)
+            yy, xx = np.meshgrid(y_range, x_range, indexing='ij')
+            pixel_indices = yy * width + xx
+            
+            # UV координати обраних пікселів
+            p_uv = pixel_uvs[pixel_indices].reshape(-1, 2)
+            
+            # 3. ВЕКТОРНА БАРИЦЕНТРИКА ДЛЯ МАСИВУ ПІКСЕЛІВ
+            A, B, C = t_uv[0], t_uv[1], t_uv[2]
+            v0 = B - A
+            v1 = C - A
+            v2 = p_uv - A
+
+            d00 = np.dot(v0, v0)
+            d01 = np.dot(v0, v1)
+            d11 = np.dot(v1, v1)
+            d20 = np.einsum('ij,j->i', v2, v0)
+            d21 = np.einsum('ij,j->i', v2, v1)
+            
+            denom = d00 * d11 - d01 * d01
+            if abs(denom) < 1e-6:
+                continue
+                
+            v = (d11 * d20 - d01 * d21) / denom
+            w = (d00 * d21 - d01 * d20) / denom
+            u = 1.0 - v - w
+            
+            # Фільтр: залишаємо лише ті пікселі, які реально всередині трикутника
+            inside = (u >= 0) & (v >= 0) & (w >= 0)
+            if not np.any(inside):
+                continue
+                
+            valid_pixels = pixel_indices.flatten()[inside]
+            u, v, w = u[inside], v[inside], w[inside]
+            weights = np.stack([u, v, w], axis=-1) # Форма: (M_valid_pixels, 3)
+
+            # 4. ВЕКТОРНЕ ОБЧИСЛЕННЯ ПОЗИЦІЙ ТА TBN
+            # Збираємо 3D-локальні координати вершин трикутника
+            v_idx = poly.vertices
+            tri_cos = vert_cos[v_idx] # (3, 3)
+            
+            # Інтерполяція 3D-координат для всіх валідних пікселів одразу
+            lp_local_pos = np.dot(weights, tri_cos) # (M, 3)
+            # Перевід у Світовий простір (додаємо 1 для гомогенних координат)
+            lp_world_pos = np.dot(np.hstack([lp_local_pos, np.ones((len(lp_local_pos), 1))]), lp_world_mat.T)[:, :3]
+
+            # Збір та інтерполяція TBN даних з циклів полігону
+            l_idx = poly.loop_indices
+            ns_vert = np.array([lp_mesh.vertices[lp_mesh.loops[li].vertex_index].normal for li in l_idx])
+            ts_vert = np.array([lp_mesh.loops[li].tangent for li in l_idx])
+            bts_vert = np.array([lp_mesh.loops[li].bitangent * lp_mesh.loops[li].bitangent_sign for li in l_idx])
+
+            N_smooth_local = np.dot(weights, ns_vert)
+            T_local = np.dot(weights, ts_vert)
+            B_local = np.dot(weights, bts_vert)
+            
+            # Нормалізація векторів
+            N_smooth_local /= np.linalg.norm(N_smooth_local, axis=1, keepdims=True)
+            T_local /= np.linalg.norm(T_local, axis=1, keepdims=True)
+            B_local /= np.linalg.norm(B_local, axis=1, keepdims=True)
+
+            # Трансформація TBN у світовий простір
+            T_world = np.dot(T_local, lp_world_mat[:3, :3].T)
+            B_world = np.dot(B_local, lp_world_mat[:3, :3].T)
+            N_smooth_world = np.dot(N_smooth_local, lp_norm_mat)
+            
+            # Для Flat Pass використовується єдина нормаль полігону
+            N_flat_world = np.dot(poly.normal, lp_norm_mat)
+            N_flat_world /= np.linalg.norm(N_flat_world)
+
+            # 5. ТРАСУВАННЯ ПРОМЕНІВ (Оскільки BVHTree не підтримує масиви, тут ми вимушено викликаємо C++ ray_cast)
+            hp_local_ray_starts = np.dot(np.hstack([lp_world_pos, np.ones((len(lp_world_pos), 1))]), hp_world_inv.T)[:, :3]
+            # Напрямки променів для Smooth Pass (інтерполовані для кожного пікселя)
+            hp_local_dirs_smooth = np.dot(N_smooth_world, hp_world_inv[:3, :3].T)
+            # Напрямок променя для Flat Pass (однаковий для ВСІХ пікселів у межах цього полігону)
+            # N_flat_world має форму (3,), тому ми трансформуємо його один раз і дублюємо під розмір масиву пікселів
+            N_flat_world_local = np.dot(N_flat_world, hp_world_inv[:3, :3].T)
+            hp_local_dirs_flat = np.repeat(N_flat_world_local[np.newaxis, :], len(valid_pixels), axis=0)
+        
+            for i, pixel_idx in enumerate(valid_pixels):
+                start = Vector(hp_local_ray_starts[i])
+                
+                # --- ЧАСТИНА 1: SMOOTH PASS ---
+                dir_smooth = Vector(hp_local_dirs_smooth[i])
+                # ray_cast повертає: (location, normal, index, distance) або (None, None, None, None)
+                hit_loc, hit_norm, hit_idx, hit_dist = hp_bvh.ray_cast(start, dir_smooth, ray_max_dist)
+                
+                # Якщо промах — стріляємо у зворотний бік (Bake Cage Inside)
+                if hit_loc is None:
+                    hit_loc, hit_norm, hit_idx, hit_dist = hp_bvh.ray_cast(start, -dir_smooth, ray_max_dist)
+                    
+                # Перевіряємо, чи ми дійсно знайшли геометрію High-Poly
+                if hit_norm is not None:
+                    # Конвертуємо mathutils Vector у масив NumPy для векторизованого множення
+                    hp_local_norm = np.array(hit_norm)
+                    
+                    # Переводимо нормаль з локального простору HP у світовий простір
+                    hit_normal_world = np.dot(hp_local_norm, np.linalg.inv(hp_world_mat[:3, :3]).T)
+                    hit_normal_world /= np.linalg.norm(hit_normal_world)
+                    
+                    # Проекція на TBN простір
+                    tx = np.dot(hit_normal_world, T_world[i])
+                    ty = np.dot(hit_normal_world, B_world[i])
+                    tz = np.dot(hit_normal_world, N_smooth_world[i])
+                    
+                    buffer_smooth[pixel_idx] = [tx * 0.5 + 0.5, ty * 0.5 + 0.5, tz * 0.5 + 0.5, 1.0]
+
+                # --- ЧАСТИНА 2: FLAT PASS ---
+                dir_flat = Vector(hp_local_dirs_flat[i])
+                hit_loc_f, hit_norm_f, hit_idx_f, hit_dist_f = hp_bvh.ray_cast(start, dir_flat, ray_max_dist)
+                
+                if hit_loc_f is None:
+                    hit_loc_f, hit_norm_f, hit_idx_f, hit_dist_f = hp_bvh.ray_cast(start, -dir_flat, ray_max_dist)
+                    
+                if hit_norm_f is not None:
+                    hp_local_norm_f = np.array(hit_norm_f)
+                    
+                    hit_normal_world_flat = np.dot(hp_local_norm_f, np.linalg.inv(hp_world_mat[:3, :3]).T)
+                    hit_normal_world_flat /= np.linalg.norm(hit_normal_world_flat)
+                    
+                    # Для Flat Pass використовуємо геометричну нормаль полігону (N_flat_world)
+                    tx_f = np.dot(hit_normal_world_flat, T_world[i])
+                    ty_f = np.dot(hit_normal_world_flat, B_world[i])
+                    tz_f = np.dot(hit_normal_world_flat, N_flat_world)
+                    
+                    buffer_flat[pixel_idx] = [tx_f * 0.5 + 0.5, ty_f * 0.5 + 0.5, tz_f * 0.5 + 0.5, 1.0]
+
+                
+        # Повертаємо фінальні масиви, готові до foreach_set
+        return buffer_smooth.reshape(height, width, 4), buffer_flat.reshape(height, width, 4)
+
 
 
 class OBJECT_OT_activate_skew_paint(bpy.types.Operator):
