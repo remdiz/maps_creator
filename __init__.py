@@ -15,6 +15,8 @@
 #   - Testing https://share.google/aimode/3KIwIqBOAgwVyvUNi
 #   - Get rid of using names of objects and materials, use references instead
 #   - Cursor change
+#   - Bakes for different objects with different materials
+#   - Progress bar
 # ==================================================================
 
 import bpy      # type: ignore
