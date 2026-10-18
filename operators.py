@@ -299,7 +299,9 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         
         # 3. Оптимізуємо Samples (для запікання карт нормалей 16-32 семплів більш ніж достатньо, 
         # великі значення лише марнують час і не впливають на якість векторів)
-        cycles_settings.bake_samples = 16
+        cycles_settings.samples = 1
+        cycles_settings.device = 'GPU'
+        render_settings.use_persistent_data = True
         
         # 4. Налаштовуємо параметри запікання в Cycles
         bake_settings = scene.render.bake
@@ -603,6 +605,8 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         # # TODO: if bake fails, scene becomes corrupted -> restore previous state
         # with context.temp_override(active_object=merged_lp, selected_objects=[merged_hp, merged_lp]):
         #     bpy.ops.object.bake(type='NORMAL')
+        start_time = time.time()
+        
         self.bake_normal_map(context, smoothness=True, texture_node=self.node_smooth_ref)
         
         
@@ -646,7 +650,7 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
             settings.extrusion_preview_obj = None
         settings.show_extrusion = False    
 
-        self.report({'INFO'}, "Batch baking finished! Both textures ready.")
+        self.report({'INFO'}, f"Batch baking finished in {time.time() - start_time:.2f}s.")
 
         # === STEP 6: MIX SHADER COMPILATION ===
         self.report({'INFO'}, "Final shader creation...")
