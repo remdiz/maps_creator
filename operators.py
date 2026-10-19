@@ -801,19 +801,92 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
             tex_mask.update()
     
     
+    @staticmethod
+    def pad_normal_buffers(buffer_smooth, buffer_flat, covered, width, height, margin=16):
+        smooth_pixels = buffer_smooth.reshape(height, width, 4)
+        flat_pixels = buffer_flat.reshape(height, width, 4)
+        directions = (
+            (-1, -1), (-1, 0), (-1, 1),
+            (0, -1),             (0, 1),
+            (1, -1),  (1, 0),   (1, 1),
+        )
+
+        for _ in range(margin):
+            claimed = covered.copy()
+            changed = False
+            for dy, dx in directions:
+                target_y0 = max(0, dy)
+                target_y1 = min(height, height + dy)
+                target_x0 = max(0, dx)
+                target_x1 = min(width, width + dx)
+                source_y0 = max(0, -dy)
+                source_y1 = min(height, height - dy)
+                source_x0 = max(0, -dx)
+                source_x1 = min(width, width - dx)
+
+                source_covered = covered[source_y0:source_y1, source_x0:source_x1]
+                target_claimed = claimed[target_y0:target_y1, target_x0:target_x1]
+                fill = source_covered & ~target_claimed
+                if not np.any(fill):
+                    continue
+
+                target_smooth = smooth_pixels[target_y0:target_y1, target_x0:target_x1]
+                source_smooth = smooth_pixels[source_y0:source_y1, source_x0:source_x1]
+                target_flat = flat_pixels[target_y0:target_y1, target_x0:target_x1]
+                source_flat = flat_pixels[source_y0:source_y1, source_x0:source_x1]
+                target_smooth[fill] = source_smooth[fill]
+                target_flat[fill] = source_flat[fill]
+                target_claimed[fill] = True
+                changed = True
+
+            if not changed:
+                break
+            covered = claimed
+
+    @staticmethod
+    def interpolate_hit_normal(hit_location, triangle, corner_normals):
+        point = np.asarray(hit_location, dtype=np.float64)
+        a, b, c = triangle
+        edge_0 = b - a
+        edge_1 = c - a
+        offset = point - a
+        dot_00 = np.dot(edge_0, edge_0)
+        dot_01 = np.dot(edge_0, edge_1)
+        dot_11 = np.dot(edge_1, edge_1)
+        dot_20 = np.dot(offset, edge_0)
+        dot_21 = np.dot(offset, edge_1)
+        denominator = dot_00 * dot_11 - dot_01 * dot_01
+
+        if denominator <= np.finfo(np.float64).eps * dot_00 * dot_11:
+            normal = np.cross(edge_0, edge_1)
+        else:
+            weight_b = (dot_11 * dot_20 - dot_01 * dot_21) / denominator
+            weight_c = (dot_00 * dot_21 - dot_01 * dot_20) / denominator
+            weights = np.array((1.0 - weight_b - weight_c, weight_b, weight_c))
+            normal = np.dot(weights, corner_normals)
+
+        normal_length = np.linalg.norm(normal)
+        if not np.isfinite(normal_length) or normal_length <= 1e-12:
+            return None
+        return normal / normal_length
+
     def bake_normal_bvhtree(self, context, settings):
         """Bakes normal map using BVH tree raycasting for high-poly to low-poly transfer"""
-        width = int(settings.resolution)
-        height = int(settings.resolution)
-        # TODO: this is wrong! we should use mesh extrusion from the Displace modifier, not the user input
-        ray_max_dist = settings.extrusion
-        is_directx = settings.directx
-        
         depsgraph = context.evaluated_depsgraph_get()
         lp_obj = settings.merged_lp_obj.evaluated_get(depsgraph)
+        lp_mesh = bpy.data.meshes.new_from_object(lp_obj)
+        try:
+            return self._bake_normal_bvhtree_mesh(
+                settings, depsgraph, lp_obj, lp_mesh
+            )
+        finally:
+            bpy.data.meshes.remove(lp_mesh, do_unlink=True)
+
+    def _bake_normal_bvhtree_mesh(self, settings, depsgraph, lp_obj, lp_mesh):
+        width = int(settings.resolution)
+        height = int(settings.resolution)
         hp_obj = settings.merged_hp_obj
         
-        lp_mesh = bpy.data.meshes.new_from_object(lp_obj)
         # hp_mesh = hp_obj.to_mesh()
         bm = bmesh.new()
         bm.from_mesh(lp_mesh)
@@ -823,27 +896,50 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
 
         lp_mesh.calc_tangents()
         
-        # Створення BVH-дерева High-Poly
-        hp_bvh = BVHTree.FromObject(hp_obj, depsgraph, epsilon=0.0001)
-        
         # Трансформаційні матриці
         lp_world_mat = np.array(lp_obj.matrix_world)
-        hp_world_inv = np.array(hp_obj.matrix_world.inverted())
-        hp_world_mat = np.array(hp_obj.matrix_world)
-        
-        # Матриця нормалей LP (Inverse Transpose 3x3)
-        lp_norm_mat = np.linalg.inv(lp_world_mat[:3, :3]).T
+        hp_eval = hp_obj.evaluated_get(depsgraph)
+        hp_world_inv = np.array(hp_eval.matrix_world.inverted())
+        hp_world_mat = np.array(hp_eval.matrix_world)
 
-        # 1. СТВОРЕННЯ СІТКИ ПІКСЕЛІВ (Pixel Grid)
-        # Створюємо масив координат центрів усіх пікселів у UV-просторі
-        u = np.linspace(0.5 / width, 1.0 - 0.5 / width, width)
-        v = np.linspace(0.5 / height, 1.0 - 0.5 / height, height)
-        uu, vv = np.meshgrid(u, v)
-        pixel_uvs = np.stack([uu, vv], axis=-1).reshape(-1, 2) # Форма: (N_pixels, 2)
+        lp_norm_mat = np.linalg.inv(lp_world_mat[:3, :3])
+        hp_norm_mat = np.linalg.inv(hp_world_mat[:3, :3])
+
+        hp_mesh = bpy.data.meshes.new_from_object(hp_eval)
+        try:
+            hp_mesh.calc_loop_triangles()
+            hp_vertex_coordinates = np.empty(len(hp_mesh.vertices) * 3, dtype=np.float64)
+            hp_mesh.vertices.foreach_get("co", hp_vertex_coordinates)
+            hp_vertex_coordinates = hp_vertex_coordinates.reshape(-1, 3)
+
+            hp_triangles = [tuple(triangle.vertices) for triangle in hp_mesh.loop_triangles]
+            hp_triangle_coordinates = hp_vertex_coordinates[np.asarray(hp_triangles)]
+            hp_triangle_normals = np.empty((len(hp_triangles), 3, 3), dtype=np.float64)
+            for triangle_index, triangle in enumerate(hp_mesh.loop_triangles):
+                polygon = hp_mesh.polygons[triangle.polygon_index]
+                if polygon.use_smooth:
+                    hp_triangle_normals[triangle_index] = [
+                        hp_mesh.loops[loop_index].normal
+                        for loop_index in triangle.loops
+                    ]
+                else:
+                    hp_triangle_normals[triangle_index] = polygon.normal
+
+            hp_bvh = BVHTree.FromPolygons(
+                [Vector(coordinate) for coordinate in hp_vertex_coordinates],
+                hp_triangles,
+                all_triangles=True,
+                epsilon=0.0001,
+            )
+        finally:
+            bpy.data.meshes.remove(hp_mesh, do_unlink=True)
 
         # Вихідні буфери текстур
-        buffer_smooth = np.array([0.5, 0.5, 1.0, 1.0] * (width * height), dtype=np.float32).reshape(-1, 4)
-        buffer_flat = np.array([0.5, 0.5, 1.0, 1.0] * (width * height), dtype=np.float32).reshape(-1, 4)
+        buffer_smooth = np.empty((width * height, 4), dtype=np.float32)
+        buffer_flat = np.empty((width * height, 4), dtype=np.float32)
+        buffer_smooth[:] = (0.5, 0.5, 1.0, 1.0)
+        buffer_flat[:] = (0.5, 0.5, 1.0, 1.0)
+        covered = np.zeros((height, width), dtype=bool)
 
         # 2. ЕКСТРАКЦІЯ ДАНИХ ГЕОМЕТРІЇ
         uv_layer = lp_mesh.uv_layers.active.data
@@ -870,7 +966,7 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         # Для швидкості ітеруємо лише трикутники, але обчислення всередині них — векторні
         for tri_idx, poly in enumerate(lp_mesh.polygons):
             # Обмежувальний прямокутник трикутника в пікселях
-            t_uv = tri_uvs[tri_idx]
+            t_uv = tri_uvs[tri_idx].astype(np.float64)
             p_min = np.floor(np.min(t_uv, axis=0) * [width, height]).astype(int)
             p_max = np.ceil(np.max(t_uv, axis=0) * [width, height]).astype(int)
             
@@ -887,7 +983,13 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
             pixel_indices = yy * width + xx
             
             # UV координати обраних пікселів
-            p_uv = pixel_uvs[pixel_indices].reshape(-1, 2)
+            p_uv = np.stack(
+                (
+                    (xx.ravel() + 0.5) / width,
+                    (yy.ravel() + 0.5) / height,
+                ),
+                axis=-1,
+            )
             
             # 3. ВЕКТОРНА БАРИЦЕНТРИКА ДЛЯ МАСИВУ ПІКСЕЛІВ
             A, B, C = t_uv[0], t_uv[1], t_uv[2]
@@ -902,7 +1004,7 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
             d21 = np.einsum('ij,j->i', v2, v1)
             
             denom = d00 * d11 - d01 * d01
-            if abs(denom) < 1e-6:
+            if denom <= np.finfo(np.float64).eps * d00 * d11:
                 continue
                 
             v = (d11 * d20 - d01 * d21) / denom
@@ -915,6 +1017,7 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
                 continue
                 
             valid_pixels = pixel_indices.flatten()[inside]
+            covered.ravel()[valid_pixels] = True
             u, v, w = u[inside], v[inside], w[inside]
             weights = np.stack([u, v, w], axis=-1) # Форма: (M_valid_pixels, 3)
 
@@ -930,27 +1033,85 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
 
             # Збір та інтерполяція TBN даних з циклів полігону
             l_idx = poly.loop_indices
-            ns_vert = np.array([lp_mesh.vertices[lp_mesh.loops[li].vertex_index].normal for li in l_idx])
+            ns_vert = np.array([lp_mesh.loops[li].normal for li in l_idx])
             ts_vert = np.array([lp_mesh.loops[li].tangent for li in l_idx])
-            bts_vert = np.array([lp_mesh.loops[li].bitangent * lp_mesh.loops[li].bitangent_sign for li in l_idx])
+            bts_vert = np.array([
+                lp_mesh.loops[li].bitangent * lp_mesh.loops[li].bitangent_sign
+                for li in l_idx
+            ])
 
             N_smooth_local = np.dot(weights, ns_vert)
             T_local = np.dot(weights, ts_vert)
             B_local = np.dot(weights, bts_vert)
-            
-            # Нормалізація векторів
-            N_smooth_local /= np.linalg.norm(N_smooth_local, axis=1, keepdims=True)
-            T_local /= np.linalg.norm(T_local, axis=1, keepdims=True)
-            B_local /= np.linalg.norm(B_local, axis=1, keepdims=True)
 
             # Трансформація TBN у світовий простір
-            T_world = np.dot(T_local, lp_world_mat[:3, :3].T)
-            B_world = np.dot(B_local, lp_world_mat[:3, :3].T)
+            T_world_raw = np.dot(T_local, lp_world_mat[:3, :3].T)
+            B_world_raw = np.dot(B_local, lp_world_mat[:3, :3].T)
             N_smooth_world = np.dot(N_smooth_local, lp_norm_mat)
+            smooth_normal_lengths = np.linalg.norm(N_smooth_world, axis=1)
+            smooth_normal_valid = (
+                np.isfinite(smooth_normal_lengths) & (smooth_normal_lengths > 1e-12)
+            )
+            N_smooth_world = np.divide(
+                N_smooth_world,
+                smooth_normal_lengths[:, np.newaxis],
+                out=np.zeros_like(N_smooth_world),
+                where=smooth_normal_valid[:, np.newaxis],
+            )
+
+            T_smooth_raw = T_world_raw - (
+                np.einsum('ij,ij->i', T_world_raw, N_smooth_world)[:, np.newaxis]
+                * N_smooth_world
+            )
+            smooth_tangent_lengths = np.linalg.norm(T_smooth_raw, axis=1)
+            smooth_tangent_valid = (
+                np.isfinite(smooth_tangent_lengths) & (smooth_tangent_lengths > 1e-12)
+            )
+            T_smooth = np.divide(
+                T_smooth_raw,
+                smooth_tangent_lengths[:, np.newaxis],
+                out=np.zeros_like(T_smooth_raw),
+                where=smooth_tangent_valid[:, np.newaxis],
+            )
+            smooth_handedness = np.sign(
+                np.einsum(
+                    'ij,ij->i',
+                    np.cross(N_smooth_world, T_smooth),
+                    B_world_raw,
+                )
+            )
+            smooth_handedness[smooth_handedness == 0] = 1.0
+            B_smooth = np.cross(N_smooth_world, T_smooth) * smooth_handedness[:, np.newaxis]
             
             # Для Flat Pass використовується єдина нормаль полігону
             N_flat_world = np.dot(poly.normal, lp_norm_mat)
-            N_flat_world /= np.linalg.norm(N_flat_world)
+            flat_normal_length = np.linalg.norm(N_flat_world)
+            flat_normal_valid = np.isfinite(flat_normal_length) and flat_normal_length > 1e-12
+            if flat_normal_valid:
+                N_flat_world /= flat_normal_length
+
+            T_flat_raw = T_world_raw - np.einsum(
+                'ij,j->i', T_world_raw, N_flat_world
+            )[:, np.newaxis] * N_flat_world
+            flat_tangent_lengths = np.linalg.norm(T_flat_raw, axis=1)
+            flat_tangent_valid = (
+                np.isfinite(flat_tangent_lengths) & (flat_tangent_lengths > 1e-12)
+            )
+            T_flat = np.divide(
+                T_flat_raw,
+                flat_tangent_lengths[:, np.newaxis],
+                out=np.zeros_like(T_flat_raw),
+                where=flat_tangent_valid[:, np.newaxis],
+            )
+            flat_handedness = np.sign(
+                np.einsum(
+                    'ij,ij->i',
+                    np.cross(N_flat_world, T_flat),
+                    B_world_raw,
+                )
+            )
+            flat_handedness[flat_handedness == 0] = 1.0
+            B_flat = np.cross(N_flat_world, T_flat) * flat_handedness[:, np.newaxis]
 
             # 5. ТРАСУВАННЯ ПРОМЕНІВ (Оскільки BVHTree не підтримує масиви, тут ми вимушено викликаємо C++ ray_cast)
             hp_local_ray_starts = np.dot(np.hstack([lp_world_pos, np.ones((len(lp_world_pos), 1))]), hp_world_inv.T)[:, :3]
@@ -965,52 +1126,63 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
                 start = Vector(hp_local_ray_starts[i])
                 
                 # --- ЧАСТИНА 1: SMOOTH PASS ---
-                dir_smooth = Vector(hp_local_dirs_smooth[i])
-                # ray_cast повертає: (location, normal, index, distance) або (None, None, None, None)
-                hit_loc, hit_norm, hit_idx, hit_dist = hp_bvh.ray_cast(start, dir_smooth, ray_max_dist)
-                
-                # Якщо промах — стріляємо у зворотний бік (Bake Cage Inside)
-                if hit_loc is None:
-                    hit_loc, hit_norm, hit_idx, hit_dist = hp_bvh.ray_cast(start, -dir_smooth, ray_max_dist)
-                    
-                # Перевіряємо, чи ми дійсно знайшли геометрію High-Poly
+                if smooth_normal_valid[i] and smooth_tangent_valid[i]:
+                    dir_smooth = Vector(hp_local_dirs_smooth[i])
+                    hit_loc, hit_norm, hit_idx, hit_dist = hp_bvh.ray_cast(start, dir_smooth)
+                    if hit_loc is None:
+                        hit_loc, hit_norm, hit_idx, hit_dist = hp_bvh.ray_cast(start, -dir_smooth)
+                else:
+                    hit_norm = None
+
                 if hit_norm is not None:
-                    # Конвертуємо mathutils Vector у масив NumPy для векторизованого множення
-                    hp_local_norm = np.array(hit_norm)
+                    hp_local_norm = self.interpolate_hit_normal(
+                        hit_loc, hp_triangle_coordinates[hit_idx],
+                        hp_triangle_normals[hit_idx],
+                    )
+                    if hp_local_norm is None:
+                        hp_local_norm = np.array(hit_norm)
                     
                     # Переводимо нормаль з локального простору HP у світовий простір
-                    hit_normal_world = np.dot(hp_local_norm, np.linalg.inv(hp_world_mat[:3, :3]).T)
+                    hit_normal_world = np.dot(hp_local_norm, hp_norm_mat)
                     hit_normal_world /= np.linalg.norm(hit_normal_world)
                     
                     # Проекція на TBN простір
-                    tx = np.dot(hit_normal_world, T_world[i])
-                    ty = np.dot(hit_normal_world, B_world[i])
+                    tx = np.dot(hit_normal_world, T_smooth[i])
+                    ty = np.dot(hit_normal_world, B_smooth[i])
                     tz = np.dot(hit_normal_world, N_smooth_world[i])
                     
                     buffer_smooth[pixel_idx] = [tx * 0.5 + 0.5, ty * 0.5 + 0.5, tz * 0.5 + 0.5, 1.0]
 
                 # --- ЧАСТИНА 2: FLAT PASS ---
-                dir_flat = Vector(hp_local_dirs_flat[i])
-                hit_loc_f, hit_norm_f, hit_idx_f, hit_dist_f = hp_bvh.ray_cast(start, dir_flat, ray_max_dist)
+                if flat_normal_valid and flat_tangent_valid[i]:
+                    dir_flat = Vector(hp_local_dirs_flat[i])
+                    hit_loc_f, hit_norm_f, hit_idx_f, hit_dist_f = hp_bvh.ray_cast(start, dir_flat)
                 
-                if hit_loc_f is None:
-                    hit_loc_f, hit_norm_f, hit_idx_f, hit_dist_f = hp_bvh.ray_cast(start, -dir_flat, ray_max_dist)
+                    if hit_loc_f is None:
+                        hit_loc_f, hit_norm_f, hit_idx_f, hit_dist_f = hp_bvh.ray_cast(start, -dir_flat)
+                else:
+                    hit_norm_f = None
                     
                 if hit_norm_f is not None:
-                    hp_local_norm_f = np.array(hit_norm_f)
+                    hp_local_norm_f = self.interpolate_hit_normal(
+                        hit_loc_f, hp_triangle_coordinates[hit_idx_f],
+                        hp_triangle_normals[hit_idx_f],
+                    )
+                    if hp_local_norm_f is None:
+                        hp_local_norm_f = np.array(hit_norm_f)
                     
-                    hit_normal_world_flat = np.dot(hp_local_norm_f, np.linalg.inv(hp_world_mat[:3, :3]).T)
+                    hit_normal_world_flat = np.dot(hp_local_norm_f, hp_norm_mat)
                     hit_normal_world_flat /= np.linalg.norm(hit_normal_world_flat)
                     
                     # Для Flat Pass використовуємо геометричну нормаль полігону (N_flat_world)
-                    tx_f = np.dot(hit_normal_world_flat, T_world[i])
-                    ty_f = np.dot(hit_normal_world_flat, B_world[i])
+                    tx_f = np.dot(hit_normal_world_flat, T_flat[i])
+                    ty_f = np.dot(hit_normal_world_flat, B_flat[i])
                     tz_f = np.dot(hit_normal_world_flat, N_flat_world)
                     
                     buffer_flat[pixel_idx] = [tx_f * 0.5 + 0.5, ty_f * 0.5 + 0.5, tz_f * 0.5 + 0.5, 1.0]
 
                 
-        # Повертаємо фінальні масиви, готові до foreach_set
+        self.pad_normal_buffers(buffer_smooth, buffer_flat, covered, width, height)
         return buffer_smooth.reshape(height, width, 4), buffer_flat.reshape(height, width, 4)
 
 
