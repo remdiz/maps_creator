@@ -894,6 +894,9 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         bm.to_mesh(lp_mesh)
         bm.free() # Звільняємо пам'ять bmesh
 
+        for polygon in lp_mesh.polygons:
+            polygon.use_smooth = True
+        lp_mesh.update()
         lp_mesh.calc_tangents()
         
         # Трансформаційні матриці
@@ -911,6 +914,10 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
             hp_vertex_coordinates = np.empty(len(hp_mesh.vertices) * 3, dtype=np.float64)
             hp_mesh.vertices.foreach_get("co", hp_vertex_coordinates)
             hp_vertex_coordinates = hp_vertex_coordinates.reshape(-1, 3)
+            ray_origin_offset = max(
+                1e-4,
+                float(np.max(np.ptp(hp_vertex_coordinates, axis=0))) * 1e-5,
+            )
 
             hp_triangles = [tuple(triangle.vertices) for triangle in hp_mesh.loop_triangles]
             hp_triangle_coordinates = hp_vertex_coordinates[np.asarray(hp_triangles)]
@@ -1015,10 +1022,20 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
             inside = (u >= 0) & (v >= 0) & (w >= 0)
             if not np.any(inside):
                 continue
-                
-            valid_pixels = pixel_indices.flatten()[inside]
+
+            candidate_pixels = pixel_indices.ravel()[inside]
+            candidate_u = u[inside]
+            candidate_v = v[inside]
+            candidate_w = w[inside]
+            unclaimed = ~covered.ravel()[candidate_pixels]
+            if not np.any(unclaimed):
+                continue
+
+            valid_pixels = candidate_pixels[unclaimed]
             covered.ravel()[valid_pixels] = True
-            u, v, w = u[inside], v[inside], w[inside]
+            u = candidate_u[unclaimed]
+            v = candidate_v[unclaimed]
+            w = candidate_w[unclaimed]
             weights = np.stack([u, v, w], axis=-1) # Форма: (M_valid_pixels, 3)
 
             # 4. ВЕКТОРНЕ ОБЧИСЛЕННЯ ПОЗИЦІЙ ТА TBN
@@ -1127,10 +1144,14 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
                 
                 # --- ЧАСТИНА 1: SMOOTH PASS ---
                 if smooth_normal_valid[i] and smooth_tangent_valid[i]:
-                    dir_smooth = Vector(hp_local_dirs_smooth[i])
-                    hit_loc, hit_norm, hit_idx, hit_dist = hp_bvh.ray_cast(start, dir_smooth)
+                    dir_smooth = Vector(hp_local_dirs_smooth[i]).normalized()
+                    hit_loc, hit_norm, hit_idx, hit_dist = hp_bvh.ray_cast(
+                        start - dir_smooth * ray_origin_offset, dir_smooth
+                    )
                     if hit_loc is None:
-                        hit_loc, hit_norm, hit_idx, hit_dist = hp_bvh.ray_cast(start, -dir_smooth)
+                        hit_loc, hit_norm, hit_idx, hit_dist = hp_bvh.ray_cast(
+                            start + dir_smooth * ray_origin_offset, -dir_smooth
+                        )
                 else:
                     hit_norm = None
 
@@ -1155,21 +1176,20 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
 
                 # --- ЧАСТИНА 2: FLAT PASS ---
                 if flat_normal_valid and flat_tangent_valid[i]:
-                    dir_flat = Vector(hp_local_dirs_flat[i])
-                    hit_loc_f, hit_norm_f, hit_idx_f, hit_dist_f = hp_bvh.ray_cast(start, dir_flat)
+                    dir_flat = Vector(hp_local_dirs_flat[i]).normalized()
+                    hit_loc_f, hit_norm_f, hit_idx_f, hit_dist_f = hp_bvh.ray_cast(
+                        start - dir_flat * ray_origin_offset, dir_flat
+                    )
                 
                     if hit_loc_f is None:
-                        hit_loc_f, hit_norm_f, hit_idx_f, hit_dist_f = hp_bvh.ray_cast(start, -dir_flat)
+                        hit_loc_f, hit_norm_f, hit_idx_f, hit_dist_f = hp_bvh.ray_cast(
+                            start + dir_flat * ray_origin_offset, -dir_flat
+                        )
                 else:
                     hit_norm_f = None
                     
                 if hit_norm_f is not None:
-                    hp_local_norm_f = self.interpolate_hit_normal(
-                        hit_loc_f, hp_triangle_coordinates[hit_idx_f],
-                        hp_triangle_normals[hit_idx_f],
-                    )
-                    if hp_local_norm_f is None:
-                        hp_local_norm_f = np.array(hit_norm_f)
+                    hp_local_norm_f = np.array(hit_norm_f)
                     
                     hit_normal_world_flat = np.dot(hp_local_norm_f, hp_norm_mat)
                     hit_normal_world_flat /= np.linalg.norm(hit_normal_world_flat)
