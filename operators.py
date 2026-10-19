@@ -802,7 +802,9 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
     
     
     @staticmethod
-    def pad_normal_buffers(buffer_smooth, buffer_flat, covered, width, height, margin=16):
+    def pad_normal_buffers(
+        buffer_smooth, buffer_flat, covered_smooth, covered_flat, width, height, margin=16
+    ):
         smooth_pixels = buffer_smooth.reshape(height, width, 4)
         flat_pixels = buffer_flat.reshape(height, width, 4)
         directions = (
@@ -812,36 +814,37 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         )
 
         for _ in range(margin):
-            claimed = covered.copy()
             changed = False
-            for dy, dx in directions:
-                target_y0 = max(0, dy)
-                target_y1 = min(height, height + dy)
-                target_x0 = max(0, dx)
-                target_x1 = min(width, width + dx)
-                source_y0 = max(0, -dy)
-                source_y1 = min(height, height - dy)
-                source_x0 = max(0, -dx)
-                source_x1 = min(width, width - dx)
+            for pixels, covered in (
+                (smooth_pixels, covered_smooth),
+                (flat_pixels, covered_flat),
+            ):
+                claimed = covered.copy()
+                for dy, dx in directions:
+                    target_y0 = max(0, dy)
+                    target_y1 = min(height, height + dy)
+                    target_x0 = max(0, dx)
+                    target_x1 = min(width, width + dx)
+                    source_y0 = max(0, -dy)
+                    source_y1 = min(height, height - dy)
+                    source_x0 = max(0, -dx)
+                    source_x1 = min(width, width - dx)
 
-                source_covered = covered[source_y0:source_y1, source_x0:source_x1]
-                target_claimed = claimed[target_y0:target_y1, target_x0:target_x1]
-                fill = source_covered & ~target_claimed
-                if not np.any(fill):
-                    continue
+                    source_covered = covered[source_y0:source_y1, source_x0:source_x1]
+                    target_claimed = claimed[target_y0:target_y1, target_x0:target_x1]
+                    fill = source_covered & ~target_claimed
+                    if not np.any(fill):
+                        continue
 
-                target_smooth = smooth_pixels[target_y0:target_y1, target_x0:target_x1]
-                source_smooth = smooth_pixels[source_y0:source_y1, source_x0:source_x1]
-                target_flat = flat_pixels[target_y0:target_y1, target_x0:target_x1]
-                source_flat = flat_pixels[source_y0:source_y1, source_x0:source_x1]
-                target_smooth[fill] = source_smooth[fill]
-                target_flat[fill] = source_flat[fill]
-                target_claimed[fill] = True
-                changed = True
+                    target_pixels = pixels[target_y0:target_y1, target_x0:target_x1]
+                    source_pixels = pixels[source_y0:source_y1, source_x0:source_x1]
+                    target_pixels[fill] = source_pixels[fill]
+                    target_claimed[fill] = True
+                    changed = True
+                covered[:] = claimed
 
             if not changed:
                 break
-            covered = claimed
 
     @staticmethod
     def interpolate_hit_normal(hit_location, triangle, corner_normals):
@@ -914,10 +917,6 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
             hp_vertex_coordinates = np.empty(len(hp_mesh.vertices) * 3, dtype=np.float64)
             hp_mesh.vertices.foreach_get("co", hp_vertex_coordinates)
             hp_vertex_coordinates = hp_vertex_coordinates.reshape(-1, 3)
-            ray_origin_offset = max(
-                1e-4,
-                float(np.max(np.ptp(hp_vertex_coordinates, axis=0))) * 1e-5,
-            )
 
             hp_triangles = [tuple(triangle.vertices) for triangle in hp_mesh.loop_triangles]
             hp_triangle_coordinates = hp_vertex_coordinates[np.asarray(hp_triangles)]
@@ -946,7 +945,9 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         buffer_flat = np.empty((width * height, 4), dtype=np.float32)
         buffer_smooth[:] = (0.5, 0.5, 1.0, 1.0)
         buffer_flat[:] = (0.5, 0.5, 1.0, 1.0)
-        covered = np.zeros((height, width), dtype=bool)
+        rasterized = np.zeros((height, width), dtype=bool)
+        covered_smooth = np.zeros((height, width), dtype=bool)
+        covered_flat = np.zeros((height, width), dtype=bool)
 
         # 2. ЕКСТРАКЦІЯ ДАНИХ ГЕОМЕТРІЇ
         uv_layer = lp_mesh.uv_layers.active.data
@@ -1027,12 +1028,12 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
             candidate_u = u[inside]
             candidate_v = v[inside]
             candidate_w = w[inside]
-            unclaimed = ~covered.ravel()[candidate_pixels]
+            unclaimed = ~rasterized.ravel()[candidate_pixels]
             if not np.any(unclaimed):
                 continue
 
             valid_pixels = candidate_pixels[unclaimed]
-            covered.ravel()[valid_pixels] = True
+            rasterized.ravel()[valid_pixels] = True
             u = candidate_u[unclaimed]
             v = candidate_v[unclaimed]
             w = candidate_w[unclaimed]
@@ -1130,28 +1131,24 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
             flat_handedness[flat_handedness == 0] = 1.0
             B_flat = np.cross(N_flat_world, T_flat) * flat_handedness[:, np.newaxis]
 
-            # 5. ТРАСУВАННЯ ПРОМЕНІВ (Оскільки BVHTree не підтримує масиви, тут ми вимушено викликаємо C++ ray_cast)
-            hp_local_ray_starts = np.dot(np.hstack([lp_world_pos, np.ones((len(lp_world_pos), 1))]), hp_world_inv.T)[:, :3]
-            # Напрямки променів для Smooth Pass (інтерполовані для кожного пікселя)
-            hp_local_dirs_smooth = np.dot(N_smooth_world, hp_world_inv[:3, :3].T)
-            # Напрямок променя для Flat Pass (однаковий для ВСІХ пікселів у межах цього полігону)
-            # N_flat_world має форму (3,), тому ми трансформуємо його один раз і дублюємо під розмір масиву пікселів
-            N_flat_world_local = np.dot(N_flat_world, hp_world_inv[:3, :3].T)
-            hp_local_dirs_flat = np.repeat(N_flat_world_local[np.newaxis, :], len(valid_pixels), axis=0)
+            # 5. ЗНАХОДЖЕННЯ НАЙБЛИЖЧОЇ ПОВЕРХНІ HP ВІД CAGE-ПОЗИЦІЙ LP
+            cage_extrusion = float(settings.extrusion)
+            smooth_nearest_origins = lp_world_pos + N_smooth_world * cage_extrusion
+            hp_local_nearest_origins_smooth = np.dot(
+                np.hstack([smooth_nearest_origins, np.ones((len(smooth_nearest_origins), 1))]),
+                hp_world_inv.T,
+            )[:, :3]
+            flat_nearest_origins = lp_world_pos + N_flat_world[np.newaxis, :] * cage_extrusion
+            hp_local_nearest_origins_flat = np.dot(
+                np.hstack([flat_nearest_origins, np.ones((len(flat_nearest_origins), 1))]),
+                hp_world_inv.T,
+            )[:, :3]
         
             for i, pixel_idx in enumerate(valid_pixels):
-                start = Vector(hp_local_ray_starts[i])
-                
                 # --- ЧАСТИНА 1: SMOOTH PASS ---
                 if smooth_normal_valid[i] and smooth_tangent_valid[i]:
-                    dir_smooth = Vector(hp_local_dirs_smooth[i]).normalized()
-                    hit_loc, hit_norm, hit_idx, hit_dist = hp_bvh.ray_cast(
-                        start - dir_smooth * ray_origin_offset, dir_smooth
-                    )
-                    if hit_loc is None:
-                        hit_loc, hit_norm, hit_idx, hit_dist = hp_bvh.ray_cast(
-                            start + dir_smooth * ray_origin_offset, -dir_smooth
-                        )
+                    start_smooth = Vector(hp_local_nearest_origins_smooth[i])
+                    hit_loc, hit_norm, hit_idx, hit_dist = hp_bvh.find_nearest(start_smooth)
                 else:
                     hit_norm = None
 
@@ -1173,18 +1170,12 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
                     tz = np.dot(hit_normal_world, N_smooth_world[i])
                     
                     buffer_smooth[pixel_idx] = [tx * 0.5 + 0.5, ty * 0.5 + 0.5, tz * 0.5 + 0.5, 1.0]
+                    covered_smooth.ravel()[pixel_idx] = True
 
                 # --- ЧАСТИНА 2: FLAT PASS ---
                 if flat_normal_valid and flat_tangent_valid[i]:
-                    dir_flat = Vector(hp_local_dirs_flat[i]).normalized()
-                    hit_loc_f, hit_norm_f, hit_idx_f, hit_dist_f = hp_bvh.ray_cast(
-                        start - dir_flat * ray_origin_offset, dir_flat
-                    )
-                
-                    if hit_loc_f is None:
-                        hit_loc_f, hit_norm_f, hit_idx_f, hit_dist_f = hp_bvh.ray_cast(
-                            start + dir_flat * ray_origin_offset, -dir_flat
-                        )
+                    start_flat = Vector(hp_local_nearest_origins_flat[i])
+                    hit_loc_f, hit_norm_f, hit_idx_f, hit_dist_f = hp_bvh.find_nearest(start_flat)
                 else:
                     hit_norm_f = None
                     
@@ -1200,9 +1191,17 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
                     tz_f = np.dot(hit_normal_world_flat, N_flat_world)
                     
                     buffer_flat[pixel_idx] = [tx_f * 0.5 + 0.5, ty_f * 0.5 + 0.5, tz_f * 0.5 + 0.5, 1.0]
+                    covered_flat.ravel()[pixel_idx] = True
 
                 
-        self.pad_normal_buffers(buffer_smooth, buffer_flat, covered, width, height)
+        self.pad_normal_buffers(
+            buffer_smooth,
+            buffer_flat,
+            covered_smooth,
+            covered_flat,
+            width,
+            height,
+        )
         return buffer_smooth.reshape(height, width, 4), buffer_flat.reshape(height, width, 4)
 
 
