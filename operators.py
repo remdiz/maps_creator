@@ -609,7 +609,7 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         # # TODO: if bake fails, scene becomes corrupted -> restore previous state
         # with context.temp_override(active_object=merged_lp, selected_objects=[merged_hp, merged_lp]):
         #     bpy.ops.object.bake(type='NORMAL')
-        start_time = time.time()
+        bake_time = time.time()
         
         # self.bake_normal_map(context, smoothness=True, texture_node=self.node_smooth_ref)
         
@@ -656,7 +656,7 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
             settings.extrusion_preview_obj = None
         settings.show_extrusion = False    
 
-        self.report({'INFO'}, f"Batch baking finished in {time.time() - start_time:.2f}s.")
+        self.report({'INFO'}, f"Bhvtree baking finished in {time.time() - bake_time:.2f}s.")
 
         # === STEP 6: MIX SHADER COMPILATION ===
         self.report({'INFO'}, "Final shader creation...")
@@ -737,7 +737,7 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         #     children.get(settings.hp_collection.name).exclude = True
         self.postprocess(context)
 
-        self.report({'INFO'}, "Baking finished!")
+        self.report({'INFO'}, f"Batch baking finished in {time.time() - start_time:.2f}s.")
         return {'FINISHED'}
 
 
