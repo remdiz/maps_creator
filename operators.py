@@ -226,15 +226,10 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
                     # Duplicate object w/o using operators
                     object_eval = obj.evaluated_get(depsgraph)
                     mesh_from_eval = bpy.data.meshes.new_from_object(object_eval)
-                    matrix = obj.matrix_world
-
-                    # Apply the object's transform matrix to the mesh using a copy. this is just one way to do this,
-                    # you could also use bm.transform, etc.
-                    mesh_copy = mesh_from_eval.copy()
-                    mesh_copy.transform(matrix)
+                    mesh_from_eval.transform(obj.matrix_world)
 
                     # Add the transformed mesh to the bmesh
-                    bm.from_mesh(mesh_copy)
+                    bm.from_mesh(mesh_from_eval)
 
                     # new_obj = bpy.data.objects.new(obj.name, mesh_from_eval)
                     # context.scene.collection.objects.link(new_obj)
@@ -253,9 +248,7 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
                     # obj_copy = context.view_layer.objects.active
                     # duplicates.append(obj_copy)
 
-                    # ВИПРАВЛЕНО: Негайно видаляємо копію з бази Blender, 
-                    # щоб вона не висіла «мертвим вантажем» у пам'яті
-                    bpy.data.meshes.remove(mesh_copy, do_unlink=True)
+                    # Remove the temporary evaluated mesh from Blender's datablocks.
                     bpy.data.meshes.remove(mesh_from_eval, do_unlink=True)
 
         # Convert the bmesh to the new mesh
@@ -392,17 +385,16 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         merged_hp = settings.merged_hp_obj
         for poly in merged_lp.data.polygons:
             poly.use_smooth = smoothness
-            merged_lp.data.update() # Flush data changes to database
-    
-            
-            # Робимо активною ноду Smooth текстури
-            bake_mat.node_tree.nodes.active = texture_node
-            texture_node.select = True
-            
-            # Execute bake inside a safe context override wrapper
-            # TODO: if bake fails, scene becomes corrupted -> restore previous state
-            with context.temp_override(active_object=merged_lp, selected_objects=[merged_hp, merged_lp]):
-                bpy.ops.object.bake(type='NORMAL')
+        merged_lp.data.update()
+
+        # Робимо активною ноду Smooth текстури
+        bake_mat.node_tree.nodes.active = texture_node
+        texture_node.select = True
+
+        # Execute bake inside a safe context override wrapper
+        # TODO: if bake fails, scene becomes corrupted -> restore previous state
+        with context.temp_override(active_object=merged_lp, selected_objects=[merged_hp, merged_lp]):
+            bpy.ops.object.bake(type='NORMAL')
 
     
     def create_mix_shader(self, context):
