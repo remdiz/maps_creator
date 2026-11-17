@@ -443,6 +443,17 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
             links.new(node_normal_map.outputs['Normal'], principled_node.inputs['Normal'])
         
     
+    @classmethod
+    def find_layer_collection(cls, layer_collection, collection):
+        if layer_collection.collection == collection:
+            return layer_collection
+
+        for child in layer_collection.children:
+            found = cls.find_layer_collection(child, collection)
+            if found:
+                return found
+
+        return None
     
     def postprocess(self, context):
         settings = context.scene.smart_bake_settings
@@ -459,13 +470,19 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
                     if space.type == 'VIEW_3D':
                         space.shading.type = 'MATERIAL'
 
-        children = context.view_layer.layer_collection.children
+        root = context.view_layer.layer_collection
                 
         # Instantly access and exclude layer collections via their names from pointers
         if settings.lp_collection:
-            children.get(settings.lp_collection.name).exclude = True
+            lp_layer_collection = self.find_layer_collection(root, settings.lp_collection)
+            if lp_layer_collection:
+                lp_layer_collection.exclude = True
+            # children.get(settings.lp_collection.name).exclude = True
         if settings.hp_collection:
-            children.get(settings.hp_collection.name).exclude = True
+            hp_layer_collection = self.find_layer_collection(root, settings.hp_collection)
+            if hp_layer_collection:
+                hp_layer_collection.exclude = True
+            # children.get(settings.hp_collection.name).exclude = True
     
     
     def execute(self, context):
@@ -931,15 +948,17 @@ class OBJECT_OT_finalize_bake(bpy.types.Operator):
         OBJECT_OT_bake_normals.cleanup_assets(context)
 
         # Restore visibility settings for user's source target arrays
-        children = context.view_layer.layer_collection.children
+        root = context.view_layer.layer_collection
         if props.lp_collection:
             # children.get(props.lp_collection.name).exclude = False
-            low_col = children.get(props.lp_collection.name)
+            # low_col = children.get(props.lp_collection.name)
+            low_col = OBJECT_OT_bake_normals.find_layer_collection(root, props.lp_collection)
             if low_col:
                 low_col.exclude = False
         if props.hp_collection:
             # children.get(props.hp_collection.name).exclude = False
-            high_col = children.get(props.hp_collection.name)
+            # high_col = children.get(props.hp_collection.name)
+            high_col = OBJECT_OT_bake_normals.find_layer_collection(root, props.hp_collection)
             if high_col:
                 high_col.exclude = False
         
