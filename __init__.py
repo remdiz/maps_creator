@@ -17,6 +17,8 @@
 #   - Cursor change
 #   - Bakes for different objects with different materials
 #   - Progress bar
+#   - Create new view layer before baking and add baking objects to it. 
+#       So that Cycles don`t proccess other meshes in the scene, which can be very time consuming
 # ==================================================================
 
 import bpy      # type: ignore

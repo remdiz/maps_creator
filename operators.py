@@ -277,7 +277,7 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         """Checks if all mesh objects in the collection have UV maps"""
         missing_uv_objects = []
         for obj in collection.objects:
-            if obj.type == 'MESH':
+            if obj.type == 'MESH' and not obj.hide_get():
                 if not obj.data.uv_layers:
                     missing_uv_objects.append(obj.name)
         return missing_uv_objects
@@ -489,11 +489,7 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         start_time = time.time()
         scene = context.scene
         settings = scene.smart_bake_settings
-        # Run pre-bake cleanup to wipe any leftovers from previous sessions
-        self.report({'INFO'}, "Performing pre-bake cleanup...")
-        self.cleanup_assets(context)
-        self.report({'INFO'}, f"Cleanup complete in {time.time() - start_time:.2f}s.")
-        
+                
         # === Step 0: UV MAPS VALIDATION ON LOW-POLY ===
         # lp_objects = settings.lp_collection.objects
         missing_uv_objects = self.check_uv_maps(settings.lp_collection)
@@ -510,6 +506,11 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
             error_msg = f"Error: objects missing UV-maps: {', '.join(missing_uv_objects)}"
             self.report({'ERROR'}, error_msg)
             return {'CANCELLED'}
+
+        # Run pre-bake cleanup to wipe any leftovers from previous sessions
+        self.report({'INFO'}, "Performing pre-bake cleanup...")
+        self.cleanup_assets(context)
+        self.report({'INFO'}, f"Cleanup complete in {time.time() - start_time:.2f}s.")
             
         self.report({'INFO'}, "Geometry proccessing...")
         # Save links to originally active and selected objects
@@ -637,7 +638,7 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         # with context.temp_override(active_object=merged_lp, selected_objects=[merged_hp, merged_lp]):
         #     bpy.ops.object.bake(type='NORMAL')
         self.bake_normal_map(context, smoothness=False, texture_node=self.node_flat_ref)
-        
+        self.report({'INFO'}, f"Cycles baking finished in {time.time() - bake_time:.2f}s.")
         
         # Reset shading state back to smooth
         # bpy.ops.object.shade_smooth()
@@ -659,7 +660,7 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
             settings.extrusion_preview_obj = None
         settings.show_extrusion = False    
 
-        self.report({'INFO'}, f"Cycles baking finished in {time.time() - bake_time:.2f}s.")
+        
 
         # === STEP 6: MIX SHADER COMPILATION ===
         self.report({'INFO'}, "Final shader creation...")
