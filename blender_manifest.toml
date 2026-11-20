@@ -1,23 +1,21 @@
 schema_version = "1.0.0"
 
-# Example of manifest file for a Blender extension
-# Change the values according to your extension
 id = "maps_creator"
-version = "1.0.0"
+version = "0.1.0"
 name = "Maps_creator"
-tagline = "This is another extension"
+tagline = "Texture maps baking extension"
 maintainer = "Vitaly Kotsur"
 # Supported types: "add-on", "theme"
 type = "add-on"
 
 # Optional link to documentation, support, source files, etc
-# website = "https://extensions.blender.org/add-ons/my-example-package/"
+website = "https://github.com/remdiz/maps_creator"
 
 # Optional list defined by Blender and server, see:
 # https://docs.blender.org/manual/en/dev/advanced/extensions/tags.html
-tags = ["Animation", "Sequencer"]
+tags = ["Bake", "Game Engine", "Import-Export"]
 
-blender_version_min = "4.2.0"
+blender_version_min = "4.5.0"
 # # Optional: Blender version that the extension does not support, earlier versions are supported.
 # # This can be omitted and defined later on the extensions platform if an issue is found.
 # blender_version_max = "5.1.0"
@@ -58,9 +56,9 @@ license = [
 # Keep this a single short sentence without a period (.) at the end.
 # For longer explanations use the documentation or detail page.
 #
-# [permissions]
+[permissions]
 # network = "Need to sync motion-capture data to server"
-# files = "Import/export FBX from/to disk"
+files = "Import/export texture from/to disk"
 # clipboard = "Copy and paste bone transforms"
 
 # Optional: build settings.
