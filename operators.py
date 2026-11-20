@@ -362,10 +362,11 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         
         # 3. Создаем один единственный чистый материал для запекания
         bake_mat = bpy.data.materials.new(name="M_SmartBake_Internal")
-        bake_mat.diffuse_color = (0.05, 0.05, 0.05, 1.0)  # RGBA: grey
+        
 
         settings.internal_material = bake_mat
         bake_mat.use_nodes = True
+        # bake_mat.diffuse_color = (0.05, 0.05, 0.05, 1.0)  # RGBA: dark grey
         lp_obj.data.materials.append(bake_mat)
 
         nodes = bake_mat.node_tree.nodes
@@ -443,6 +444,7 @@ class OBJECT_OT_bake_normals(bpy.types.Operator):
         if principled_node:
             links.new(node_mix.outputs['Result'], node_normal_map.inputs['Color'])
             links.new(node_normal_map.outputs['Normal'], principled_node.inputs['Normal'])
+            principled_node.inputs["Base Color"].default_value = (0.05, 0.05, 0.05, 1.0)    # dark grey
         
     
     @classmethod
